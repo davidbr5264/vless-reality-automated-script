@@ -58,10 +58,6 @@ err()  { echo "  ERROR: $1" >&2; }
 # ---------------------------------------------------------------------------
 SNI_DOMAIN_DEFAULT="${SNI_DOMAIN:-i.ytimg.com}"   # REALITY camouflage target
 LISTEN_PORT_DEFAULT="${LISTEN_PORT:-443}"         # Xray listen port
-if ! [[ "$LISTEN_PORT_DEFAULT" =~ ^[0-9]+$ ]] || [[ "$LISTEN_PORT_DEFAULT" -lt 1 ]] || [[ "$LISTEN_PORT_DEFAULT" -gt 65535 ]]; then
-  err "LISTEN_PORT must be a number between 1 and 65535 (got: '${LISTEN_PORT_DEFAULT}')."
-  exit 1
-fi
 # Used as a fallback to install the 'reality' shortcut when this script is
 # run via a process substitution / pipe (e.g. `bash <(curl -Ls ...)`),
 # where $0 doesn't point to an actual file on disk. Override via env var
@@ -100,6 +96,11 @@ case "${1:-}" in
     exit 1
     ;;
 esac
+
+if ! [[ "$LISTEN_PORT_DEFAULT" =~ ^[0-9]+$ ]] || [[ "$LISTEN_PORT_DEFAULT" -lt 1 ]] || [[ "$LISTEN_PORT_DEFAULT" -gt 65535 ]]; then
+  err "LISTEN_PORT must be a number between 1 and 65535 (got: '${LISTEN_PORT_DEFAULT}')."
+  exit 1
+fi
 
 # ---------------------------------------------------------------------------
 # Preflight checks
@@ -502,6 +503,19 @@ output_client_info() {
     echo "         Everything else succeeded -- find your IP manually (e.g. 'curl ifconfig.me' or" >&2
     echo "         your VPS provider's dashboard) and substitute it into the link below." >&2
     server_ip="YOUR_SERVER_IP"
+  fi
+
+  # Detect IP changes since the last time this was generated (VPS
+  # migration, provider re-assigning the address, etc). Without this, a
+  # changed IP goes completely unnoticed -- old client links just
+  # silently stop working with no hint as to why.
+  if [[ -f "$CLIENT_INFO_FILE" ]] && [[ "$server_ip" != "YOUR_SERVER_IP" ]]; then
+    local previous_ip
+    previous_ip=$(grep -m1 "^Server IP" "$CLIENT_INFO_FILE" 2>/dev/null | awk -F': ' '{print $2}' | tr -d ' ')
+    if [[ -n "$previous_ip" ]] && [[ "$previous_ip" != "$server_ip" ]] && [[ "$previous_ip" != "YOUR_SERVER_IP" ]]; then
+      warn "Server IP changed since the last run: ${previous_ip} -> ${server_ip}"
+      echo "         Any device using the old link needs to re-import the new one below." >&2
+    fi
   fi
 
   local vless_link="vless://${UUID}@${server_ip}:${LISTEN_PORT}?type=tcp&security=reality&pbk=${PUBLIC_KEY}&fp=chrome&sni=${SNI_DOMAIN}&sid=${SHORT_ID}&flow=xtls-rprx-vision&spx=%2F#xray-reality-$(hostname)"
