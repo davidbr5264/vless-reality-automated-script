@@ -21,6 +21,9 @@
 #                                           (keeps the most recent of each run)
 #   ./setup-xray-reality.sh --restore TS   Restore config/state from a backup
 #                                           (backs up current state first)
+#   ./setup-xray-reality.sh --status       Consolidated health check: BBR, qdisc,
+#                                           UFW, fail2ban jail, reboot timer,
+#                                           backup count, last update check
 #   ./setup-xray-reality.sh --help         Show this help
 #
 # What a full install does:
@@ -78,6 +81,7 @@ case "${1:-}" in
   --show)          MODE="show" ;;
   --list-backups)  MODE="list-backups" ;;
   --dedupe-backups) MODE="dedupe-backups" ;;
+  --status)        MODE="status" ;;
   --restore)
     MODE="restore"
     RESTORE_TS="${2:-}"
@@ -87,7 +91,7 @@ case "${1:-}" in
     fi
     ;;
   --help|-h)
-    sed -n '2,41p' "$0"
+    sed -n '2,44p' "$0"
     exit 0
     ;;
   "") ;;
@@ -109,6 +113,19 @@ if [[ $EUID -ne 0 ]]; then
   err "This script must be run as root (use sudo)."
   exit 1
 fi
+
+# One line per run, appended on every exit path (success, error, or an
+# early exit deep in some step) via the EXIT trap -- so "when did I last
+# touch this, and did it work" is answerable later without guessing from
+# backup timestamps alone (which get pruned).
+AUDIT_LOG="/var/log/reality-setup.log"
+log_run_outcome() {
+  local exit_code=$?
+  local outcome="success"
+  [[ "$exit_code" -ne 0 ]] && outcome="failed(exit ${exit_code})"
+  echo "$(date -Is) mode=${MODE} outcome=${outcome}" >> "$AUDIT_LOG" 2>/dev/null || true
+}
+trap log_run_outcome EXIT
 
 # Prevent two concurrent runs (e.g. accidentally launched in two terminals)
 # from racing on the same config/backup/state files. Held for the life of
@@ -648,6 +665,69 @@ if [[ "$MODE" == "dedupe-backups" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+# MODE: --status  (read-only consolidated health check)
+# ---------------------------------------------------------------------------
+if [[ "$MODE" == "status" ]]; then
+  echo "=== Xray REALITY status ==="
+
+  echo ""
+  SERVICE_STATE=$(systemctl is-active "${SERVICE_NAME}" 2>/dev/null || echo "unknown")
+  echo "Service (${SERVICE_NAME})   : ${SERVICE_STATE}"
+
+  ACTIVE_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
+  echo "Congestion control  : ${ACTIVE_CC} $( [[ "$ACTIVE_CC" != "bbr" ]] && echo "(expected bbr)" )"
+
+  PRIMARY_IFACE=$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i=="dev") print $(i+1)}' | head -n1)
+  if [[ -n "$PRIMARY_IFACE" ]]; then
+    CURRENT_QDISC=$(tc qdisc show dev "$PRIMARY_IFACE" 2>/dev/null | awk '/root/ {print $2; exit}')
+    echo "qdisc (${PRIMARY_IFACE})       : ${CURRENT_QDISC:-unknown} $( [[ "$CURRENT_QDISC" != "fq" ]] && echo "(expected fq)" )"
+  fi
+
+  if ufw status 2>/dev/null | grep -q "Status: active"; then
+    echo "UFW                 : active"
+  else
+    echo "UFW                 : NOT active"
+  fi
+
+  if fail2ban-client status sshd >/dev/null 2>&1; then
+    BANNED_COUNT=$(fail2ban-client status sshd 2>/dev/null | awk -F: '/Currently banned/ {gsub(/[ \t]/,"",$2); print $2}')
+    echo "fail2ban sshd jail  : loaded (currently banned: ${BANNED_COUNT:-0})"
+  else
+    echo "fail2ban sshd jail  : NOT loaded"
+  fi
+
+  if systemctl is-enabled --quiet daily-reboot.timer 2>/dev/null; then
+    NEXT_REBOOT=$(systemctl list-timers daily-reboot.timer --no-legend 2>/dev/null | awk '{print $1, $2, $3}')
+    echo "Daily reboot timer  : enabled (next: ${NEXT_REBOOT:-unknown})"
+  else
+    echo "Daily reboot timer  : NOT enabled"
+  fi
+
+  if [[ -d "$BACKUP_ROOT" ]]; then
+    BACKUP_COUNT=$(find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
+    echo "Backups available   : ${BACKUP_COUNT}"
+  else
+    echo "Backups available   : 0"
+  fi
+
+  XRAY_UPDATE_CHECK_CACHE="${XRAY_CONFIG_DIR}/.last-xray-checkupdate"
+  if [[ -f "$XRAY_UPDATE_CHECK_CACHE" ]]; then
+    LAST_CHECK_EPOCH=$(cat "$XRAY_UPDATE_CHECK_CACHE" 2>/dev/null || echo "")
+    if [[ "$LAST_CHECK_EPOCH" =~ ^[0-9]+$ ]]; then
+      echo "Xray-core last checked for updates: $(date -d "@${LAST_CHECK_EPOCH}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "unknown")"
+    fi
+  fi
+
+  if [[ -f "$AUDIT_LOG" ]]; then
+    echo ""
+    echo "Recent activity (last 5 runs):"
+    tail -n 5 "$AUDIT_LOG" | sed 's/^/  /'
+  fi
+
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
 # MODE: --restore <timestamp>  (restore config + state from a prior backup)
 # ---------------------------------------------------------------------------
 if [[ "$MODE" == "restore" ]]; then
@@ -951,6 +1031,28 @@ step "4/9" "Writing Xray config (privacy-minded: no access logging)"
 write_config
 ok "Config written and validated"
 
+# Best-effort check: is the DoH DNS config we just wrote actually reachable
+# from this VPS? Some regions/networks block DoH providers at the network
+# level -- if that happens, Xray's own domain-based routing could silently
+# fail even though the REALITY tunnel itself stays up, since the two are
+# largely independent. Non-fatal, since a transient failure here isn't
+# worth aborting the whole install over.
+DOH_UNREACHABLE=""
+for doh_host in 1.1.1.1 9.9.9.9; do
+  DOH_CODE=$(curl -sS --max-time 5 -o /dev/null -w "%{http_code}" "https://${doh_host}/dns-query" 2>/dev/null)
+  DOH_RC=$?
+  if [[ "$DOH_RC" -ne 0 ]] || [[ "$DOH_CODE" == "000" ]]; then
+    DOH_UNREACHABLE="${DOH_UNREACHABLE}${doh_host} "
+  fi
+done
+if [[ -n "$DOH_UNREACHABLE" ]]; then
+  warn "Could not reach the configured DoH DNS server(s): ${DOH_UNREACHABLE}"
+  echo "         If this VPS's network blocks these, Xray's own domain-based" >&2
+  echo "         routing may fail even though REALITY itself still works." >&2
+  echo "         Check reachability manually, or edit the \"dns\" block in" >&2
+  echo "         ${CONFIG_FILE} to use a DoH provider that works from here." >&2
+fi
+
 step "5/9" "Hardening the systemd service"
 mkdir -p /etc/systemd/system/${SERVICE_NAME}.service.d
 cat > /etc/systemd/system/${SERVICE_NAME}.service.d/override.conf <<'EOF'
@@ -994,6 +1096,28 @@ Description=Local alert when xray.service exhausts its restart attempts
 Type=oneshot
 ExecStart=/bin/sh -c 'logger -p daemon.crit "xray.service has FAILED and exhausted its restart attempts -- check: journalctl -u xray -e"; wall "WARNING: xray.service has failed and given up restarting. Check: journalctl -u xray -e" || true'
 EOF
+
+# Catch unit-file mistakes automatically (e.g. a directive sitting in the
+# wrong section, silently ignored by systemd) instead of relying on
+# someone noticing manually -- this exact class of bug was found once
+# already in this script's own override.conf during manual testing.
+# Non-fatal: this is a best-effort catch, not a hard gate.
+#
+# Filters out the "Special user nobody configured" warning: the official
+# Xray installer's base unit always sets User=nobody by default (confirmed
+# from its source), which our own drop-in correctly overrides to
+# User=xray -- but systemd-analyze reports it against the unmerged base
+# file regardless, so it fires on every single real install whether or
+# not our own override actually has a problem. Suppressing this specific,
+# expected, already-handled line keeps the check meaningful instead of
+# crying wolf every run.
+if command -v systemd-analyze >/dev/null 2>&1; then
+  SYSTEMD_VERIFY_OUTPUT=$(systemd-analyze verify "${SERVICE_NAME}.service" xray-alert.service 2>&1 | grep -v "Special user nobody configured" || true)
+  if [[ -n "$SYSTEMD_VERIFY_OUTPUT" ]]; then
+    warn "systemd-analyze flagged potential issues with the unit files just written:"
+    echo "$SYSTEMD_VERIFY_OUTPUT" | sed 's/^/  /' >&2
+  fi
+fi
 
 # Reload the unit + drop-in now so the change is registered, but hold off
 # on actually restarting until every other step below has succeeded --
@@ -1083,6 +1207,12 @@ sleep 1
 if ! systemctl is-active --quiet fail2ban; then
   warn "fail2ban did not come up after restart. SSH brute-force protection"
   echo "         is NOT active. Check: journalctl -u fail2ban -e" >&2
+elif ! fail2ban-client status sshd >/dev/null 2>&1; then
+  # The daemon can be "active" while a specific jail still failed to load
+  # (e.g. a typo in the jail config) -- confirm the sshd jail itself is
+  # actually there, not just that the fail2ban process started.
+  warn "fail2ban is running, but the sshd jail did not load. SSH brute-force"
+  echo "         protection is NOT active. Check: fail2ban-client status" >&2
 fi
 
 step "8/9" "Enabling BBR + basic kernel/network hardening"
@@ -1207,6 +1337,14 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 EOF
+
+if command -v systemd-analyze >/dev/null 2>&1; then
+  SYSTEMD_VERIFY_OUTPUT=$(systemd-analyze verify daily-reboot.service daily-reboot.timer 2>&1 || true)
+  if [[ -n "$SYSTEMD_VERIFY_OUTPUT" ]]; then
+    warn "systemd-analyze flagged potential issues with the reboot timer units:"
+    echo "$SYSTEMD_VERIFY_OUTPUT" | sed 's/^/  /' >&2
+  fi
+fi
 
 systemctl daemon-reload
 systemctl enable --now daily-reboot.timer
