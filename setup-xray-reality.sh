@@ -24,7 +24,28 @@
 #   ./setup-xray-reality.sh --status       Consolidated health check: BBR, qdisc,
 #                                           UFW, fail2ban jail, reboot timer,
 #                                           backup count, last update check
+#   ./setup-xray-reality.sh --health-check Verify the service is actually
+#                                           serving (not just "active"); auto-
+#                                           restart once if not, then alert.
+#                                           Meant to be run on a timer -- see
+#                                           the reality-watchdog.timer unit.
+#   ./setup-xray-reality.sh --update-core-only
+#                                           Check for and apply an Xray-core
+#                                           update only, independent of a full
+#                                           re-run. Restarts the service only
+#                                           if the binary actually changed.
+#   ./setup-xray-reality.sh --rotate-all --force
+#                                           Same as --rotate-all, but skips
+#                                           the interactive confirmation
+#                                           prompt (required when there's no
+#                                           TTY, e.g. run from cron/CI).
 #   ./setup-xray-reality.sh --help         Show this help
+#
+# Unattended timers (installed automatically by a full install, see step 10):
+#   reality-watchdog.timer      every 10 min  -> --health-check
+#   reality-autoupdate.timer    weekly        -> --update-core-only
+# Both are ordinary systemd timers; inspect/disable with the usual
+# systemctl commands (e.g. `systemctl disable --now reality-watchdog.timer`).
 #
 # What a full install does:
 #   1. Prepares the server: full apt update/upgrade, cleanup, essential tools
@@ -37,6 +58,8 @@
 #   7. Enables BBR + fq congestion control, applies basic sysctl hardening
 #   8. Schedules a daily reboot at midnight (server local time)
 #   9. Prints a ready-to-import vless:// link + QR code
+#  10. Installs unattended reliability timers (health-check watchdog,
+#      Xray-core auto-update, config-drift check) and a login banner
 #
 # Re-running (install or any --rotate mode) automatically backs up the
 # previous config + client info under /root/xray-backups/<timestamp>/
@@ -82,6 +105,8 @@ case "${1:-}" in
   --list-backups)  MODE="list-backups" ;;
   --dedupe-backups) MODE="dedupe-backups" ;;
   --status)        MODE="status" ;;
+  --health-check)  MODE="health-check" ;;
+  --update-core-only) MODE="update-core-only" ;;
   --restore)
     MODE="restore"
     RESTORE_TS="${2:-}"
@@ -91,7 +116,7 @@ case "${1:-}" in
     fi
     ;;
   --help|-h)
-    sed -n '2,44p' "$0"
+    sed -n '2,67p' "$0"
     exit 0
     ;;
   "") ;;
@@ -100,6 +125,14 @@ case "${1:-}" in
     exit 1
     ;;
 esac
+
+# Optional second flag, currently only meaningful for --rotate-all (see
+# below): explicit opt-in to skip the interactive confirmation prompt when
+# there's no TTY to prompt on (cron, CI, orchestration tools, etc).
+FORCE_CONFIRM=0
+for arg in "$@"; do
+  [[ "$arg" == "--force" || "$arg" == "--yes" ]] && FORCE_CONFIRM=1
+done
 
 if ! [[ "$LISTEN_PORT_DEFAULT" =~ ^[0-9]+$ ]] || [[ "$LISTEN_PORT_DEFAULT" -lt 1 ]] || [[ "$LISTEN_PORT_DEFAULT" -gt 65535 ]]; then
   err "LISTEN_PORT must be a number between 1 and 65535 (got: '${LISTEN_PORT_DEFAULT}')."
@@ -229,6 +262,11 @@ backup_current_state() {
     [[ -f "$CLIENT_INFO_FILE" ]] && cp -a "$CLIENT_INFO_FILE" "$backup_dir/client-info.txt" 2>/dev/null || true
     [[ -f "$STATE_FILE" ]] && cp -a "$STATE_FILE" "$backup_dir/state" 2>/dev/null || true
     chmod -R 600 "$backup_dir"/* 2>/dev/null || true
+    # Lock down the directories themselves too, not just the files inside --
+    # mkdir uses the process umask (often 755), which would otherwise leave
+    # backup directory *listings* (filenames, sizes, timestamps) readable to
+    # any local user even though file contents are individually protected.
+    chmod 700 "$BACKUP_ROOT" "$backup_dir" 2>/dev/null || true
     echo "Backed up previous config to: $backup_dir"
 
     # Keep only the most recent 15 backups so this directory doesn't grow
@@ -430,6 +468,12 @@ EOF
   # service user rather than leaving it world-readable.
   chown root:xray "$CONFIG_FILE" 2>/dev/null || true
   chmod 640 "$CONFIG_FILE" 2>/dev/null || true
+
+  # Record a checksum of this known-good write so --health-check can detect
+  # if config.json changes outside the script later (hand edit, disk fault,
+  # another actor with root) instead of that going unnoticed indefinitely.
+  (cd "$XRAY_CONFIG_DIR" && sha256sum "$(basename "$CONFIG_FILE")" > .config.sha256 2>/dev/null) || true
+  chmod 600 "${XRAY_CONFIG_DIR}/.config.sha256" 2>/dev/null || true
 }
 
 # ---------------------------------------------------------------------------
@@ -515,8 +559,19 @@ output_client_info() {
               true)
   server_ip=$(echo "$server_ip" | tr -d '[:space:]')
 
+  # IPv4-only lookups leave an IPv6-only VPS with no usable IP even though
+  # the listener itself is dual-stack ("listen": "::"). Fall back to an
+  # IPv6-capable lookup before giving up, rather than assuming IPv4 always
+  # exists.
   if [[ -z "$server_ip" ]]; then
-    warn "Could not determine the server's public IP (all lookup services unreachable)."
+    server_ip=$(curl -fsSL -6 --max-time 5 https://api64.ipify.org 2>/dev/null || \
+                curl -fsSL -6 --max-time 5 https://icanhazip.com 2>/dev/null || \
+                true)
+    server_ip=$(echo "$server_ip" | tr -d '[:space:]')
+  fi
+
+  if [[ -z "$server_ip" ]]; then
+    warn "Could not determine the server's public IP (all lookup services unreachable, IPv4 or IPv6)."
     echo "         Everything else succeeded -- find your IP manually (e.g. 'curl ifconfig.me' or" >&2
     echo "         your VPS provider's dashboard) and substitute it into the link below." >&2
     server_ip="YOUR_SERVER_IP"
@@ -537,7 +592,14 @@ output_client_info() {
 
   local vless_link="vless://${UUID}@${server_ip}:${LISTEN_PORT}?type=tcp&security=reality&pbk=${PUBLIC_KEY}&fp=chrome&sni=${SNI_DOMAIN}&sid=${SHORT_ID}&flow=xtls-rprx-vision&spx=%2F#xray-reality-$(hostname)"
 
-  cat > "$CLIENT_INFO_FILE" <<EOF
+  # Write via mktemp (created 0600 by default) + atomic rename, rather than
+  # `cat > "$CLIENT_INFO_FILE"` followed by a separate chmod -- the latter
+  # briefly creates the file at the process's default umask (often 644)
+  # before the chmod runs, leaving the private key world-readable for a
+  # short window. mktemp avoids that window entirely.
+  local tmp_info
+  tmp_info=$(mktemp)
+  cat > "$tmp_info" <<EOF
 ================= Xray VLESS-TCP-XTLS-Vision-REALITY =================
 Server IP     : ${server_ip}
 Port          : ${LISTEN_PORT}
@@ -555,7 +617,21 @@ ${vless_link}
 ========================================================================
 Keep this file secret. It contains your private key.
 EOF
-  chmod 600 "$CLIENT_INFO_FILE"
+  chmod 600 "$tmp_info"
+  mv -f "$tmp_info" "$CLIENT_INFO_FILE"
+
+  # Also drop a scannable QR image alongside the text link, so it can be
+  # retrieved (e.g. via scp) without needing a live interactive terminal
+  # to run --show. Best-effort: qrencode's PNG output needs libpng support,
+  # which isn't guaranteed on every install, so don't fail the run over it.
+  if command -v qrencode >/dev/null 2>&1; then
+    if ! qrencode -t PNG -o "${CLIENT_INFO_FILE%.txt}-qr.png" "${vless_link}" 2>/dev/null; then
+      warn "Could not write a QR PNG (qrencode may be missing PNG/libpng support)."
+      echo "         The text link and terminal QR code above still work fine." >&2
+    else
+      chmod 600 "${CLIENT_INFO_FILE%.txt}-qr.png" 2>/dev/null || true
+    fi
+  fi
 
   local status_now
   status_now=$(systemctl is-active ${SERVICE_NAME} 2>/dev/null || echo unknown)
@@ -728,6 +804,132 @@ if [[ "$MODE" == "status" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+# MODE: --health-check  (meant to run unattended on reality-watchdog.timer)
+#
+# Goes further than systemd's own "active" notion of health: a process can
+# be running and still not actually be serving REALITY correctly (hung,
+# wedged, listening socket dropped, etc). Reuses the same handshake check
+# the install/rotate paths already run once at the end of a change, but on
+# a recurring schedule so problems that appear *between* manual runs get
+# caught instead of sitting silently broken until someone notices their
+# client can't connect.
+#
+# One self-heal attempt (a single restart), then loud local alerting if
+# that doesn't fix it -- deliberately not a restart loop, since silently
+# retrying forever can mask a real underlying problem (bad config, port
+# conflict, expired/rotated upstream SNI target) that actually needs a
+# human to look at.
+# ---------------------------------------------------------------------------
+if [[ "$MODE" == "health-check" ]]; then
+  HEALTH_ISSUE=""
+
+  if ! systemctl is-active --quiet "${SERVICE_NAME}"; then
+    HEALTH_ISSUE="service not active"
+  elif ! ss -tln 2>/dev/null | grep -q ":${LISTEN_PORT} "; then
+    HEALTH_ISSUE="active but nothing listening on port ${LISTEN_PORT}"
+  elif ! timeout 5 bash -c "exec 3<>/dev/tcp/127.0.0.1/${LISTEN_PORT}" 2>/dev/null; then
+    HEALTH_ISSUE="port ${LISTEN_PORT} listed as listening but local TCP connect failed"
+  fi
+
+  # Config-drift check: does the file on disk still match the checksum
+  # recorded at the end of the last successful write_config? A mismatch
+  # means something changed config.json outside this script since then
+  # (hand edit, disk fault, another actor with root) -- surfaced here
+  # rather than only being noticed the next time someone happens to run
+  # --status manually.
+  CONFIG_HASH_FILE="${XRAY_CONFIG_DIR}/.config.sha256"
+  DRIFT_DETECTED=0
+  if [[ -f "$CONFIG_HASH_FILE" && -f "$CONFIG_FILE" ]]; then
+    if ! (cd "$XRAY_CONFIG_DIR" && sha256sum -c "$(basename "$CONFIG_HASH_FILE")" >/dev/null 2>&1); then
+      DRIFT_DETECTED=1
+    fi
+  fi
+
+  if [[ -z "$HEALTH_ISSUE" && "$DRIFT_DETECTED" -eq 0 ]]; then
+    # Healthy and quiet -- this mode is designed to run every few minutes
+    # unattended, so success prints nothing and just exits 0. Anything
+    # noteworthy still lands in $AUDIT_LOG via the EXIT trap.
+    exit 0
+  fi
+
+  if [[ -n "$HEALTH_ISSUE" ]]; then
+    logger -p daemon.warning "reality health-check: ${HEALTH_ISSUE} -- attempting one restart" 2>/dev/null || true
+    systemctl restart "${SERVICE_NAME}" 2>/dev/null || true
+    sleep 2
+
+    STILL_BROKEN=0
+    if ! systemctl is-active --quiet "${SERVICE_NAME}"; then
+      STILL_BROKEN=1
+    elif ! ss -tln 2>/dev/null | grep -q ":${LISTEN_PORT} "; then
+      STILL_BROKEN=1
+    fi
+
+    if [[ "$STILL_BROKEN" -eq 1 ]]; then
+      logger -p daemon.crit "reality health-check: xray.service still unhealthy after restart (${HEALTH_ISSUE}) -- check: journalctl -u xray -e" 2>/dev/null || true
+      wall "WARNING: xray REALITY health-check failed and a restart didn't fix it. Check: journalctl -u xray -e" 2>/dev/null || true
+      err "Health check failed and self-heal restart did not resolve it: ${HEALTH_ISSUE}"
+      exit 1
+    else
+      logger -p daemon.notice "reality health-check: restart resolved the issue (${HEALTH_ISSUE})" 2>/dev/null || true
+      ok "Issue detected (${HEALTH_ISSUE}) -- restart resolved it."
+    fi
+  fi
+
+  if [[ "$DRIFT_DETECTED" -eq 1 ]]; then
+    logger -p daemon.warning "reality health-check: ${CONFIG_FILE} does not match the last known-good checksum -- possible unexpected change" 2>/dev/null || true
+    warn "${CONFIG_FILE} does not match the checksum recorded after the last successful write."
+    echo "         If you didn't hand-edit it, this is worth investigating." >&2
+  fi
+
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# MODE: --update-core-only  (meant to run unattended on reality-autoupdate.timer)
+#
+# Just the Xray-core version-check-and-install logic from a full install,
+# decoupled from everything else (apt upgrade, firewall, fail2ban, sysctl,
+# etc). Restarts the service only if the binary actually changed, so a
+# no-op check (already current) doesn't cause an unnecessary reconnect.
+# Lets Xray-core stay current on a schedule without needing to remember to
+# re-run the full script.
+# ---------------------------------------------------------------------------
+if [[ "$MODE" == "update-core-only" ]]; then
+  step "update-core" "Checking Xray-core for updates"
+  BEFORE_XRAY_VERSION=$(xray version 2>/dev/null | head -n1 || echo "none")
+
+  XRAY_INSTALL_ATTEMPTS=3
+  UPDATE_SUCCEEDED=0
+  for attempt in $(seq 1 "$XRAY_INSTALL_ATTEMPTS"); do
+    if bash -c "$(curl -fsSL --connect-timeout 10 --max-time 60 https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh)" @ install; then
+      UPDATE_SUCCEEDED=1
+      break
+    fi
+    if [[ "$attempt" -lt "$XRAY_INSTALL_ATTEMPTS" ]]; then
+      echo "Xray-core update attempt ${attempt} failed, retrying in 5s..."
+      sleep 5
+    fi
+  done
+
+  if [[ "$UPDATE_SUCCEEDED" -ne 1 ]]; then
+    warn "Could not reach the Xray-core installer after ${XRAY_INSTALL_ATTEMPTS} attempts (network issue?)."
+    echo "         Will try again on the next scheduled run." >&2
+    exit 1
+  fi
+
+  date +%s > "${XRAY_CONFIG_DIR}/.last-xray-checkupdate"
+  AFTER_XRAY_VERSION=$(xray version 2>/dev/null | head -n1 || echo "none")
+
+  if [[ "$BEFORE_XRAY_VERSION" == "$AFTER_XRAY_VERSION" ]]; then
+    ok "Xray-core already current (${AFTER_XRAY_VERSION}) -- no restart needed."
+  else
+    ok "Xray-core updated: ${BEFORE_XRAY_VERSION} -> ${AFTER_XRAY_VERSION}"
+    restart_and_verify
+  fi
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
 # MODE: --restore <timestamp>  (restore config + state from a prior backup)
 # ---------------------------------------------------------------------------
 if [[ "$MODE" == "restore" ]]; then
@@ -767,6 +969,10 @@ if [[ "$MODE" == "restore" ]]; then
   cp -a "${RESTORE_DIR}/config.json" "$CONFIG_FILE"
   chown root:xray "$CONFIG_FILE" 2>/dev/null || true
   chmod 640 "$CONFIG_FILE" 2>/dev/null || true
+  # Refresh the drift-detection checksum too, or --health-check would flag
+  # this restored (but legitimate) config as unexpectedly changed forever.
+  (cd "$XRAY_CONFIG_DIR" && sha256sum "$(basename "$CONFIG_FILE")" > .config.sha256 2>/dev/null) || true
+  chmod 600 "${XRAY_CONFIG_DIR}/.config.sha256" 2>/dev/null || true
   [[ -f "${RESTORE_DIR}/state" ]] && cp -a "${RESTORE_DIR}/state" "$STATE_FILE" && chmod 600 "$STATE_FILE"
   [[ -f "${RESTORE_DIR}/client-info.txt" ]] && cp -a "${RESTORE_DIR}/client-info.txt" "$CLIENT_INFO_FILE" && chmod 600 "$CLIENT_INFO_FILE"
 
@@ -806,6 +1012,15 @@ if [[ "$MODE" == "rotate-all" ]]; then
       echo "Cancelled. No changes made."
       exit 0
     fi
+  elif [[ "$FORCE_CONFIRM" -ne 1 ]]; then
+    # No TTY to prompt on (cron, CI, remote orchestration, etc). Previously
+    # this silently proceeded with a fully destructive, only-undoable-via-
+    # --restore action with zero confirmation. Require an explicit --force
+    # (or --yes) instead of defaulting to "go ahead".
+    err "--rotate-all invalidates EVERY existing client link and there's no TTY to confirm on."
+    echo "       Re-run with --rotate-all --force if you're sure this is intentional" >&2
+    echo "       (e.g. from a script or cron job), or run it interactively instead." >&2
+    exit 1
   fi
   step "rotate-all" "Rotating ALL credentials (UUID, short ID, REALITY keypair)"
   backup_current_state
@@ -909,7 +1124,7 @@ if [[ -z "$UUID" ]] && [[ -t 0 ]]; then
   echo "Using: ${SNI_DOMAIN}"
 fi
 
-step "1/9" "Preparing server (updates, cleanup, essential tools)"
+step "1/10" "Preparing server (updates, cleanup, essential tools)"
 export DEBIAN_FRONTEND=noninteractive
 # -o DPkg::Lock::Timeout=300: fresh VPS instances commonly have
 # unattended-upgrades holding the dpkg lock for the first few minutes
@@ -959,7 +1174,7 @@ if [[ -n "$SELF_UPDATE_BG_PID" ]]; then
 fi
 rm -f "$SELF_UPDATE_RESULT_FILE"
 
-step "2/9" "Installing Xray-core (official installer)"
+step "2/10" "Installing Xray-core (official installer)"
 mkdir -p "$XRAY_CONFIG_DIR"
 BEFORE_XRAY_VERSION=$(xray version 2>/dev/null | head -n1 || echo "none")
 
@@ -998,7 +1213,7 @@ fi
 
 AFTER_XRAY_VERSION=$(xray version 2>/dev/null | head -n1 || echo "none")
 
-step "3/9" "Setting up credentials (UUID, REALITY keypair, short ID)"
+step "3/10" "Setting up credentials (UUID, REALITY keypair, short ID)"
 if [[ -n "$UUID" && -n "$PRIVATE_KEY" && -n "$PUBLIC_KEY" && -n "$SHORT_ID" ]]; then
   echo "Existing credentials found in ${STATE_FILE} -- reusing them (client links stay valid)."
   echo "Need fresh credentials instead? Use --rotate-uuid or --rotate-all, not a plain re-run."
@@ -1027,7 +1242,7 @@ if [[ -n "$PORT_HOLDER" ]] && ! echo "$PORT_HOLDER" | grep -qi "xray"; then
   exit 1
 fi
 
-step "4/9" "Writing Xray config (privacy-minded: no access logging)"
+step "4/10" "Writing Xray config (privacy-minded: no access logging)"
 write_config
 ok "Config written and validated"
 
@@ -1053,7 +1268,7 @@ if [[ -n "$DOH_UNREACHABLE" ]]; then
   echo "         ${CONFIG_FILE} to use a DoH provider that works from here." >&2
 fi
 
-step "5/9" "Hardening the systemd service"
+step "5/10" "Hardening the systemd service"
 mkdir -p /etc/systemd/system/${SERVICE_NAME}.service.d
 cat > /etc/systemd/system/${SERVICE_NAME}.service.d/override.conf <<'EOF'
 [Unit]
@@ -1080,6 +1295,15 @@ LockPersonality=true
 MemoryDenyWriteExecute=true
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_BIND_SERVICE
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectProc=invisible
+RestrictNamespaces=true
+RestrictRealtime=true
+RemoveIPC=true
+RestrictAddressFamilies=AF_INET AF_INET6
+UMask=0077
 EOF
 
 # OnFailure= above fires once the restart-attempt budget (StartLimitBurst)
@@ -1140,7 +1364,7 @@ if command -v timedatectl >/dev/null 2>&1; then
   fi
 fi
 
-step "6/9" "Configuring firewall (UFW)"
+step "6/10" "Configuring firewall (UFW)"
 SSH_PORT=$(ss -tlnp 2>/dev/null | awk '/sshd/ {print $4}' | sed 's/.*://' | head -n1)
 SSH_PORT="${SSH_PORT:-22}"
 
@@ -1192,7 +1416,7 @@ if ! ufw status | grep -q "Status: active"; then
   exit 1
 fi
 
-step "7/9" "Configuring fail2ban for SSH brute-force protection"
+step "7/10" "Configuring fail2ban for SSH brute-force protection"
 cat > /etc/fail2ban/jail.d/sshd.local <<EOF
 [sshd]
 enabled = true
@@ -1215,7 +1439,7 @@ elif ! fail2ban-client status sshd >/dev/null 2>&1; then
   echo "         protection is NOT active. Check: fail2ban-client status" >&2
 fi
 
-step "8/9" "Enabling BBR + basic kernel/network hardening"
+step "8/10" "Enabling BBR + basic kernel/network hardening"
 
 # systemd-sysctl.service does NOT wait for or trigger on-demand kernel
 # module loading -- confirmed via the official sysctl.d(5) manpage. A
@@ -1304,6 +1528,11 @@ EOF
 systemctl restart systemd-journald
 
 # Prevent /var/log/xray/error.log from growing unbounded on a long-lived box.
+# mkdir -p first: logrotate install is best-effort (see step 1) and warns
+# rather than aborts if it's unavailable, so /etc/logrotate.d might not
+# exist yet on a minimal image -- without this, writing straight into a
+# missing directory would fail under `set -e`.
+mkdir -p /etc/logrotate.d
 cat > /etc/logrotate.d/xray <<'EOF'
 /var/log/xray/error.log {
   weekly
@@ -1316,7 +1545,12 @@ cat > /etc/logrotate.d/xray <<'EOF'
 }
 EOF
 
-step "9/9" "Setting up daily reboot at midnight"
+step "9/10" "Setting up daily reboot at midnight"
+# RandomizedDelaySec below spreads the actual reboot over a ~30min window
+# rather than firing at exactly 00:00:00 -- this script is public, so every
+# install left at the default would otherwise reboot in lockstep, which is
+# a free correlation signal for anyone trying to fingerprint REALITY
+# servers running this setup at scale. Costs nothing functionally.
 cat > /etc/systemd/system/daily-reboot.service <<'EOF'
 [Unit]
 Description=Daily scheduled reboot
@@ -1332,6 +1566,7 @@ Description=Daily reboot at midnight
 
 [Timer]
 OnCalendar=*-*-* 00:00:00
+RandomizedDelaySec=1800
 Persistent=true
 
 [Install]
@@ -1386,6 +1621,102 @@ else
   fi
 fi
 
+step "10/10" "Setting up unattended reliability (watchdog, auto-update, drift check, login summary)"
+
+# Only wire up timers that call `reality --health-check` / `--update-core-only`
+# if the shortcut is actually present -- if it failed to install above (rare,
+# only when both $0 wasn't a real file and re-downloading failed), don't
+# create timers that would just fail every run.
+if [[ -x "$REALITY_SHORTCUT" ]]; then
+  REALITY_TIMERS_ENABLED=1
+
+  # Watchdog: catches "process is technically active but not actually
+  # serving REALITY correctly" between manual runs -- see --health-check
+  # mode for what it checks. One self-heal restart attempt, then loud local
+  # alerting (logger + wall) if that doesn't fix it.
+  cat > /etc/systemd/system/reality-watchdog.service <<EOF
+[Unit]
+Description=Periodic Xray REALITY health check
+
+[Service]
+Type=oneshot
+ExecStart=${REALITY_SHORTCUT} --health-check
+EOF
+
+  cat > /etc/systemd/system/reality-watchdog.timer <<'EOF'
+[Unit]
+Description=Run reality health check every 10 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  # Auto-update: keeps Xray-core current on a schedule, independent of
+  # remembering to re-run the full script. RandomizedDelaySec spreads load
+  # on the upstream installer and avoids every install checking in lockstep.
+  cat > /etc/systemd/system/reality-autoupdate.service <<EOF
+[Unit]
+Description=Check for and apply Xray-core updates
+
+[Service]
+Type=oneshot
+ExecStart=${REALITY_SHORTCUT} --update-core-only
+EOF
+
+  cat > /etc/systemd/system/reality-autoupdate.timer <<'EOF'
+[Unit]
+Description=Weekly Xray-core update check
+
+[Timer]
+OnCalendar=weekly
+RandomizedDelaySec=6h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable --now reality-watchdog.timer reality-autoupdate.timer >/dev/null 2>&1 || \
+    warn "Could not enable the watchdog/auto-update timers. Check: systemctl status reality-watchdog.timer"
+  ok "Watchdog (every 10min) and auto-update (weekly) timers enabled."
+else
+  REALITY_TIMERS_ENABLED=0
+  warn "Skipping watchdog/auto-update timers -- the 'reality' shortcut isn't in place (see above)."
+fi
+
+# Login summary: surfaces service/firewall/backup state passively on every
+# SSH login (via --status, which already exists), rather than requiring
+# someone to remember to run it. Purely informational -- never blocks login.
+mkdir -p /etc/update-motd.d
+cat > /etc/update-motd.d/99-xray-reality <<EOF
+#!/bin/sh
+${REALITY_SHORTCUT} --status 2>/dev/null | head -n 10
+EOF
+chmod +x /etc/update-motd.d/99-xray-reality
+
+# Restrict unattended-upgrades to security updates only. A default install
+# of unattended-upgrades applies non-security updates too, independently of
+# and uncoordinated with this script's own apt runs and daily reboot timer
+# -- on a proxy server, minimizing uncoordinated package churn is worth
+# more than staying maximally up to date on non-security packages.
+# Best-effort: only written if unattended-upgrades is actually present.
+if dpkg -l unattended-upgrades >/dev/null 2>&1; then
+  mkdir -p /etc/apt/apt.conf.d
+  cat > /etc/apt/apt.conf.d/51-xray-security-only <<'EOF'
+Unattended-Upgrade::Allowed-Origins {
+    "${distro_id}:${distro_codename}-security";
+};
+Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
+EOF
+  ok "Configured unattended-upgrades for security-only updates."
+fi
+
 # Everything above (config, firewall, fail2ban, sysctl, reboot timer) is
 # now in place. Print the client link/QR and all summary info first, and
 # restart xray as the literal last action of the whole script.
@@ -1393,15 +1724,26 @@ save_state
 output_client_info
 
 echo ""
-echo "Setup complete. Server will reboot daily at 00:00 (server local time)."
+echo "Setup complete. Server will reboot daily at ~00:00 (+/-30min jitter, server local time)."
 echo "Check timezone with: timedatectl   (change with: timedatectl set-timezone <Region/City>)"
 echo "Cancel the daily reboot with: systemctl disable --now daily-reboot.timer"
+if [[ "$REALITY_TIMERS_ENABLED" -eq 1 ]]; then
+  echo ""
+  echo "Unattended reliability timers are active:"
+  echo "  reality-watchdog.timer     -> health check + self-heal restart every 10min"
+  echo "  reality-autoupdate.timer   -> Xray-core update check, weekly"
+  echo "  (disable either with: systemctl disable --now <name>)"
+fi
 echo ""
 echo "Re-run any time (works via either name, from any directory):"
-echo "  reality                 -> re-apply full setup (backs up old config first)"
-echo "  reality --rotate-uuid   -> revoke current client link, keep server identity"
-echo "  reality --rotate-all    -> full credential reset (invalidates everything)"
-echo "  reality --show          -> reprint current client link + QR"
+echo "  reality                     -> re-apply full setup (backs up old config first)"
+echo "  reality --rotate-uuid       -> revoke current client link, keep server identity"
+echo "  reality --rotate-all        -> full credential reset (invalidates everything)"
+echo "  reality --rotate-all --force -> same, but skips confirmation (for non-interactive use)"
+echo "  reality --show              -> reprint current client link + QR"
+echo "  reality --status            -> consolidated health/config summary"
+echo "  reality --health-check      -> run the watchdog check manually"
+echo "  reality --update-core-only  -> check/apply an Xray-core update now"
 
 step "final" "Restarting Xray"
 SERVICE_CURRENTLY_ACTIVE=$(systemctl is-active --quiet "${SERVICE_NAME}" && echo 1 || echo 0)
