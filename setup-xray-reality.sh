@@ -39,11 +39,20 @@
 #                                           the interactive confirmation
 #                                           prompt (required when there's no
 #                                           TTY, e.g. run from cron/CI).
+#   ./setup-xray-reality.sh --set-webhook <url>
+#                                           Send critical alerts (health-check
+#                                           giving up, service restart-budget
+#                                           exhausted) to a webhook URL too,
+#                                           not just local logger/wall. Sends
+#                                           a test alert immediately. Run
+#                                           with an empty URL to clear it:
+#                                           --set-webhook ""
 #   ./setup-xray-reality.sh --help         Show this help
 #
 # Unattended timers (installed automatically by a full install, see step 10):
 #   reality-watchdog.timer      every 10 min  -> --health-check
 #   reality-autoupdate.timer    weekly        -> --update-core-only
+#   reality-backup-maintenance.timer  weekly  -> --dedupe-backups
 # Both are ordinary systemd timers; inspect/disable with the usual
 # systemctl commands (e.g. `systemctl disable --now reality-watchdog.timer`).
 #
@@ -95,6 +104,13 @@ STATE_FILE="${XRAY_CONFIG_DIR}/.reality-state"    # remembers settings between r
 CLIENT_INFO_FILE="/root/xray-client-info.txt"
 BACKUP_ROOT="/root/xray-backups"
 SERVICE_NAME="xray"
+# Optional: a webhook URL (Slack/Discord/ntfy/generic POST endpoint) that
+# critical alerts (--health-check giving up, restart-budget exhaustion) get
+# POSTed to, in addition to the existing local logger/wall alerting. Unset
+# by default -- everything works exactly as before with no network calls if
+# this isn't set. Set once via: reality --set-webhook <url>  (saved to state,
+# survives re-runs) or export REALITY_ALERT_WEBHOOK=... before running.
+ALERT_WEBHOOK="${REALITY_ALERT_WEBHOOK:-}"
 
 MODE="install"
 RESTORE_TS=""
@@ -107,6 +123,18 @@ case "${1:-}" in
   --status)        MODE="status" ;;
   --health-check)  MODE="health-check" ;;
   --update-core-only) MODE="update-core-only" ;;
+  --set-webhook)
+    MODE="set-webhook"
+    WEBHOOK_ARG="${2:-}"
+    ;;
+  --send-alert)
+    # Internal mode: shared by --health-check and the xray-alert.service
+    # OnFailure unit, so "how do we notify" (local logger/wall + optional
+    # webhook) lives in one place instead of being duplicated across both.
+    # Not intended to be run by hand, though nothing stops you.
+    MODE="send-alert"
+    ALERT_MSG="${2:-Unspecified xray REALITY alert}"
+    ;;
   --restore)
     MODE="restore"
     RESTORE_TS="${2:-}"
@@ -116,7 +144,7 @@ case "${1:-}" in
     fi
     ;;
   --help|-h)
-    sed -n '2,67p' "$0"
+    sed -n '2,76p' "$0"
     exit 0
     ;;
   "") ;;
@@ -490,6 +518,7 @@ PRIVATE_KEY="${PRIVATE_KEY}"
 PUBLIC_KEY="${PUBLIC_KEY}"
 SHORT_ID="${SHORT_ID}"
 SSH_PORT="${SSH_PORT}"
+ALERT_WEBHOOK="${ALERT_WEBHOOK}"
 EOF
   chmod 600 "$tmp_state"
   mv -f "$tmp_state" "$STATE_FILE"
@@ -546,6 +575,67 @@ verify_handshake() {
   fi
 
   ok "Handshake check passed: port listening, TCP connects, TLS handshake completes."
+}
+
+# ---------------------------------------------------------------------------
+# Helper: send a critical alert both locally (logger + wall, as before) and,
+# if configured, to $ALERT_WEBHOOK. Shared by --health-check and the
+# xray-alert.service OnFailure unit so there's one place that knows how to
+# notify, instead of duplicating logger/wall/curl calls in both.
+#
+# Local alerting (logger + wall) always happens regardless of webhook config
+# -- the webhook is additive, not a replacement, so this still works exactly
+# as before on a box with no webhook set.
+# ---------------------------------------------------------------------------
+send_alert() {
+  local message="$1"
+  logger -p daemon.crit "reality alert: ${message}" 2>/dev/null || true
+  wall "WARNING (xray REALITY): ${message}" 2>/dev/null || true
+
+  if [[ -n "$ALERT_WEBHOOK" ]] && command -v curl >/dev/null 2>&1; then
+    local hostname_now escaped_message
+    hostname_now=$(hostname 2>/dev/null || echo "unknown-host")
+    # Minimal JSON string escaping (backslashes, quotes, newlines) -- the
+    # messages passed in are our own fixed strings, not arbitrary user
+    # input, but escaping costs nothing and avoids a malformed payload if
+    # a future message ever includes a quote.
+    escaped_message=$(printf '%s' "$message" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\n' ' ')
+    # Generic JSON POST body. Works as-is with ntfy and most simple
+    # webhook receivers; for Slack/Discord specifically you'd normally
+    # want a {"text": "..."} or {"content": "..."} shape instead -- if
+    # yours needs that, adjust the payload below to match.
+    curl -fsS --max-time 10 -X POST \
+      -H "Content-Type: application/json" \
+      -d "{\"host\":\"${hostname_now}\",\"message\":\"${escaped_message}\"}" \
+      "$ALERT_WEBHOOK" >/dev/null 2>&1 || \
+      logger -p daemon.warning "reality alert: webhook POST failed (network issue or bad URL?)" 2>/dev/null || true
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Helper: only actually alert on a condition *changing* state (fine -> bad,
+# or bad -> fine), not on every single --health-check tick a condition
+# happens to still be true. Without this, a persistent issue (disk still
+# low, SNI target still broken, etc) would re-fire a wall broadcast and
+# webhook POST every 10 minutes for as long as it remains unresolved --
+# noisy enough that real alerts risk getting tuned out. State is tracked
+# via a marker file per condition under $XRAY_CONFIG_DIR.
+# ---------------------------------------------------------------------------
+alert_on_transition() {
+  local condition_key="$1" is_bad="$2" bad_message="$3" resolved_message="$4"
+  local marker="${XRAY_CONFIG_DIR}/.alert-${condition_key}"
+
+  if [[ "$is_bad" -eq 1 ]]; then
+    if [[ ! -f "$marker" ]]; then
+      touch "$marker" 2>/dev/null || true
+      send_alert "$bad_message"
+    fi
+  else
+    if [[ -f "$marker" ]]; then
+      rm -f "$marker" 2>/dev/null || true
+      [[ -n "$resolved_message" ]] && logger -p daemon.notice "reality alert: ${resolved_message}" 2>/dev/null || true
+    fi
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -673,6 +763,40 @@ if [[ "$MODE" == "show" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+# MODE: --send-alert "message"  (internal; shared by --health-check and the
+# xray-alert.service OnFailure unit -- see send_alert() helper above)
+# ---------------------------------------------------------------------------
+if [[ "$MODE" == "send-alert" ]]; then
+  send_alert "$ALERT_MSG"
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# MODE: --set-webhook <url>  (or "" to clear)
+# ---------------------------------------------------------------------------
+if [[ "$MODE" == "set-webhook" ]]; then
+  if [[ -z "$UUID" ]]; then
+    err "No existing install found (${STATE_FILE}). Run a full install first."
+    exit 1
+  fi
+  if [[ -z "$WEBHOOK_ARG" ]]; then
+    ALERT_WEBHOOK=""
+    save_state
+    ok "Webhook cleared. Critical alerts will only go to local logger/wall from now on."
+  else
+    if [[ "$WEBHOOK_ARG" != http://* && "$WEBHOOK_ARG" != https://* ]]; then
+      err "Webhook URL should start with http:// or https:// (got: '${WEBHOOK_ARG}')."
+      exit 1
+    fi
+    ALERT_WEBHOOK="$WEBHOOK_ARG"
+    save_state
+    ok "Webhook saved. Sending a test alert now..."
+    send_alert "Test alert from $(hostname 2>/dev/null || echo this server) -- webhook is configured correctly if you received this."
+  fi
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
 # MODE: --list-backups  (read-only, no changes)
 # ---------------------------------------------------------------------------
 if [[ "$MODE" == "list-backups" ]]; then
@@ -744,54 +868,72 @@ fi
 # MODE: --status  (read-only consolidated health check)
 # ---------------------------------------------------------------------------
 if [[ "$MODE" == "status" ]]; then
-  echo "=== Xray REALITY status ==="
-
-  echo ""
   SERVICE_STATE=$(systemctl is-active "${SERVICE_NAME}" 2>/dev/null || echo "unknown")
-  echo "Service (${SERVICE_NAME})   : ${SERVICE_STATE}"
-
   ACTIVE_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
-  echo "Congestion control  : ${ACTIVE_CC} $( [[ "$ACTIVE_CC" != "bbr" ]] && echo "(expected bbr)" )"
 
   PRIMARY_IFACE=$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i=="dev") print $(i+1)}' | head -n1)
+  CURRENT_QDISC=""
   if [[ -n "$PRIMARY_IFACE" ]]; then
     CURRENT_QDISC=$(tc qdisc show dev "$PRIMARY_IFACE" 2>/dev/null | awk '/root/ {print $2; exit}')
-    echo "qdisc (${PRIMARY_IFACE})       : ${CURRENT_QDISC:-unknown} $( [[ "$CURRENT_QDISC" != "fq" ]] && echo "(expected fq)" )"
   fi
 
-  if ufw status 2>/dev/null | grep -q "Status: active"; then
+  UFW_ACTIVE=0
+  ufw status 2>/dev/null | grep -q "Status: active" && UFW_ACTIVE=1
+
+  FAIL2BAN_ACTIVE=0
+  BANNED_COUNT=0
+  if fail2ban-client status sshd >/dev/null 2>&1; then
+    FAIL2BAN_ACTIVE=1
+    BANNED_COUNT=$(fail2ban-client status sshd 2>/dev/null | awk -F: '/Currently banned/ {gsub(/[ \t]/,"",$2); print $2}')
+    [[ "$BANNED_COUNT" =~ ^[0-9]+$ ]] || BANNED_COUNT=0
+  fi
+
+  REBOOT_TIMER_ENABLED=0
+  NEXT_REBOOT=""
+  if systemctl is-enabled --quiet daily-reboot.timer 2>/dev/null; then
+    REBOOT_TIMER_ENABLED=1
+    NEXT_REBOOT=$(systemctl list-timers daily-reboot.timer --no-legend 2>/dev/null | awk '{print $1, $2, $3}')
+  fi
+
+  BACKUP_COUNT=0
+  if [[ -d "$BACKUP_ROOT" ]]; then
+    BACKUP_COUNT=$(find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
+  fi
+
+  XRAY_UPDATE_CHECK_CACHE="${XRAY_CONFIG_DIR}/.last-xray-checkupdate"
+  LAST_CHECK_STR=""
+  if [[ -f "$XRAY_UPDATE_CHECK_CACHE" ]]; then
+    LAST_CHECK_EPOCH=$(cat "$XRAY_UPDATE_CHECK_CACHE" 2>/dev/null || echo "")
+    if [[ "$LAST_CHECK_EPOCH" =~ ^[0-9]+$ ]]; then
+      LAST_CHECK_STR=$(date -d "@${LAST_CHECK_EPOCH}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "unknown")
+    fi
+  fi
+
+  echo "=== Xray REALITY status ==="
+  echo ""
+  echo "Service (${SERVICE_NAME})   : ${SERVICE_STATE}"
+  echo "Congestion control  : ${ACTIVE_CC} $( [[ "$ACTIVE_CC" != "bbr" ]] && echo "(expected bbr)" )"
+  if [[ -n "$PRIMARY_IFACE" ]]; then
+    echo "qdisc (${PRIMARY_IFACE})       : ${CURRENT_QDISC:-unknown} $( [[ "$CURRENT_QDISC" != "fq" ]] && echo "(expected fq)" )"
+  fi
+  if [[ "$UFW_ACTIVE" == "1" ]]; then
     echo "UFW                 : active"
   else
     echo "UFW                 : NOT active"
   fi
-
-  if fail2ban-client status sshd >/dev/null 2>&1; then
-    BANNED_COUNT=$(fail2ban-client status sshd 2>/dev/null | awk -F: '/Currently banned/ {gsub(/[ \t]/,"",$2); print $2}')
-    echo "fail2ban sshd jail  : loaded (currently banned: ${BANNED_COUNT:-0})"
+  if [[ "$FAIL2BAN_ACTIVE" == "1" ]]; then
+    echo "fail2ban sshd jail  : loaded (currently banned: ${BANNED_COUNT})"
   else
     echo "fail2ban sshd jail  : NOT loaded"
   fi
-
-  if systemctl is-enabled --quiet daily-reboot.timer 2>/dev/null; then
-    NEXT_REBOOT=$(systemctl list-timers daily-reboot.timer --no-legend 2>/dev/null | awk '{print $1, $2, $3}')
+  if [[ "$REBOOT_TIMER_ENABLED" == "1" ]]; then
     echo "Daily reboot timer  : enabled (next: ${NEXT_REBOOT:-unknown})"
   else
     echo "Daily reboot timer  : NOT enabled"
   fi
-
-  if [[ -d "$BACKUP_ROOT" ]]; then
-    BACKUP_COUNT=$(find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)
-    echo "Backups available   : ${BACKUP_COUNT}"
-  else
-    echo "Backups available   : 0"
-  fi
-
-  XRAY_UPDATE_CHECK_CACHE="${XRAY_CONFIG_DIR}/.last-xray-checkupdate"
-  if [[ -f "$XRAY_UPDATE_CHECK_CACHE" ]]; then
-    LAST_CHECK_EPOCH=$(cat "$XRAY_UPDATE_CHECK_CACHE" 2>/dev/null || echo "")
-    if [[ "$LAST_CHECK_EPOCH" =~ ^[0-9]+$ ]]; then
-      echo "Xray-core last checked for updates: $(date -d "@${LAST_CHECK_EPOCH}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "unknown")"
-    fi
+  echo "Backups available   : ${BACKUP_COUNT}"
+  if [[ -n "$LAST_CHECK_STR" ]]; then
+    echo "Xray-core last checked for updates: ${LAST_CHECK_STR}"
   fi
 
   if [[ -f "$AUDIT_LOG" ]]; then
@@ -845,10 +987,52 @@ if [[ "$MODE" == "health-check" ]]; then
     fi
   fi
 
-  if [[ -z "$HEALTH_ISSUE" && "$DRIFT_DETECTED" -eq 0 ]]; then
+  # Low-disk check: apt upgrades, xray-core updates, logs, and backups all
+  # need headroom -- catching this here means "disk full" gets flagged on
+  # its own well before it manifests as some other, more confusing failure
+  # (failed apt upgrade, failed backup, etc).
+  LOW_DISK=0
+  AVAILABLE_KB=$(df --output=avail / 2>/dev/null | tail -n1 | tr -d ' ')
+  if [[ -n "$AVAILABLE_KB" ]] && [[ "$AVAILABLE_KB" -lt 524288 ]]; then  # 512MB
+    LOW_DISK=1
+  fi
+
+  # Clock drift check: REALITY handshakes are timestamp-sensitive (see the
+  # same check done once at install time). Drift can develop later even if
+  # NTP was confirmed synced during install (e.g. ntp service dies).
+  CLOCK_DRIFT=0
+  if command -v timedatectl >/dev/null 2>&1 && [[ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" != "yes" ]]; then
+    CLOCK_DRIFT=1
+  fi
+
+  # SNI camouflage target check: if the domain REALITY is impersonating
+  # stops serving TLS1.3 (site redesign, cert change, goes offline), the
+  # tunnel can start failing in a way that looks like a REALITY problem but
+  # actually isn't -- worth surfacing on its own so troubleshooting doesn't
+  # start in the wrong place. Best-effort, not fatal.
+  SNI_BROKEN=0
+  if [[ -n "$SNI_DOMAIN" ]] && command -v openssl >/dev/null 2>&1; then
+    if ! timeout 6 openssl s_client -connect "${SNI_DOMAIN}:443" -servername "${SNI_DOMAIN}" -tls1_3 </dev/null >/dev/null 2>&1; then
+      SNI_BROKEN=1
+    fi
+  fi
+
+  # Reboot-required check: apt (unattended-upgrades or a manual run) can
+  # mark the system as needing a reboot to actually apply a security
+  # update (new kernel, libc, etc). The daily reboot timer will eventually
+  # pick this up, but "eventually, silently, up to 24h later" isn't the
+  # same as knowing about it now -- worth a one-time heads-up.
+  REBOOT_REQUIRED=0
+  [[ -f /var/run/reboot-required ]] && REBOOT_REQUIRED=1
+
+  if [[ -z "$HEALTH_ISSUE" && "$DRIFT_DETECTED" -eq 0 && "$LOW_DISK" -eq 0 && "$CLOCK_DRIFT" -eq 0 && "$SNI_BROKEN" -eq 0 && "$REBOOT_REQUIRED" -eq 0 ]]; then
     # Healthy and quiet -- this mode is designed to run every few minutes
-    # unattended, so success prints nothing and just exits 0. Anything
-    # noteworthy still lands in $AUDIT_LOG via the EXIT trap.
+    # unattended, so success prints nothing and just exits 0. Clear any
+    # stale "service-down" marker from a previous unhealthy run (e.g. it
+    # recovered on its own between ticks, not via this script's restart),
+    # so a *future* failure alerts again instead of staying silently
+    # debounced against an alert that already resolved.
+    rm -f "${XRAY_CONFIG_DIR}/.alert-service-down" 2>/dev/null || true
     exit 0
   fi
 
@@ -865,24 +1049,85 @@ if [[ "$MODE" == "health-check" ]]; then
     fi
 
     if [[ "$STILL_BROKEN" -eq 1 ]]; then
-      logger -p daemon.crit "reality health-check: xray.service still unhealthy after restart (${HEALTH_ISSUE}) -- check: journalctl -u xray -e" 2>/dev/null || true
-      wall "WARNING: xray REALITY health-check failed and a restart didn't fix it. Check: journalctl -u xray -e" 2>/dev/null || true
+      alert_on_transition "service-down" 1 \
+        "health-check: xray.service still unhealthy after a restart attempt (${HEALTH_ISSUE}). Check: journalctl -u xray -e" ""
       err "Health check failed and self-heal restart did not resolve it: ${HEALTH_ISSUE}"
       exit 1
     else
+      alert_on_transition "service-down" 0 "" "xray.service is healthy again after a restart"
       logger -p daemon.notice "reality health-check: restart resolved the issue (${HEALTH_ISSUE})" 2>/dev/null || true
       ok "Issue detected (${HEALTH_ISSUE}) -- restart resolved it."
     fi
   fi
 
   if [[ "$DRIFT_DETECTED" -eq 1 ]]; then
-    logger -p daemon.warning "reality health-check: ${CONFIG_FILE} does not match the last known-good checksum -- possible unexpected change" 2>/dev/null || true
-    warn "${CONFIG_FILE} does not match the checksum recorded after the last successful write."
-    echo "         If you didn't hand-edit it, this is worth investigating." >&2
+    alert_on_transition "config-drift" 1 \
+      "health-check: ${CONFIG_FILE} does not match the last known-good checksum -- possible unexpected change. If you didn't hand-edit it, investigate." ""
+  else
+    alert_on_transition "config-drift" 0 "" ""
+  fi
+
+  if [[ "$LOW_DISK" -eq 1 ]]; then
+    alert_on_transition "low-disk" 1 \
+      "health-check: less than 512MB free on / (found $((AVAILABLE_KB / 1024))MB). Free up space before it affects updates, logs, or backups." ""
+  else
+    alert_on_transition "low-disk" 0 "" "disk space recovered above 512MB free"
+  fi
+
+  if [[ "$CLOCK_DRIFT" -eq 1 ]]; then
+    alert_on_transition "clock-drift" 1 \
+      "health-check: system clock is not NTP-synchronized. REALITY handshakes are timestamp-sensitive; check timedatectl status." ""
+  else
+    alert_on_transition "clock-drift" 0 "" "clock is NTP-synchronized again"
+  fi
+
+  if [[ "$SNI_BROKEN" -eq 1 ]]; then
+    alert_on_transition "sni-broken" 1 \
+      "health-check: REALITY camouflage target ${SNI_DOMAIN} no longer serves TLS1.3 on port 443. This can break handshakes; consider --rotate-all with a new SNI if it stays broken." ""
+  else
+    alert_on_transition "sni-broken" 0 "" "SNI camouflage target ${SNI_DOMAIN} is serving TLS1.3 again"
+  fi
+
+  if [[ "$REBOOT_REQUIRED" -eq 1 ]]; then
+    REBOOT_PKGS=""
+    [[ -f /var/run/reboot-required.pkgs ]] && REBOOT_PKGS=$(tr '\n' ' ' < /var/run/reboot-required.pkgs 2>/dev/null | cut -c1-200)
+    alert_on_transition "reboot-required" 1 \
+      "health-check: a package update requires a reboot to take effect${REBOOT_PKGS:+ (${REBOOT_PKGS})}. The daily reboot timer will handle it automatically; reboot manually sooner if you'd rather not wait." ""
+  else
+    alert_on_transition "reboot-required" 0 "" "pending reboot requirement cleared (system was rebooted)"
+  fi
+
+  # Webhook delivery self-check: everything above only reveals a broken
+  # webhook when there's a real alert to send -- on an otherwise-healthy
+  # server, that might never happen, so a bad URL or a dead receiver could
+  # go unnoticed indefinitely. Actively verify delivery on its own slower
+  # cadence (weekly, tracked via a timestamp marker rather than a second
+  # timer unit) instead of only finding out passively.
+  if [[ -n "$ALERT_WEBHOOK" ]] && command -v curl >/dev/null 2>&1; then
+    WEBHOOK_CHECK_MARKER="${XRAY_CONFIG_DIR}/.last-webhook-verify"
+    NOW_EPOCH=$(date +%s)
+    LAST_VERIFY_EPOCH=0
+    if [[ -f "$WEBHOOK_CHECK_MARKER" ]]; then
+      LAST_VERIFY_EPOCH=$(cat "$WEBHOOK_CHECK_MARKER" 2>/dev/null || echo 0)
+      [[ "$LAST_VERIFY_EPOCH" =~ ^[0-9]+$ ]] || LAST_VERIFY_EPOCH=0
+    fi
+    if [[ $((NOW_EPOCH - LAST_VERIFY_EPOCH)) -ge 604800 ]]; then  # 7 days
+      if curl -fsS --max-time 10 -X POST -H "Content-Type: application/json" \
+          -d "{\"host\":\"$(hostname 2>/dev/null || echo unknown)\",\"message\":\"weekly webhook delivery check -- if you see this, alerting is working\"}" \
+          "$ALERT_WEBHOOK" >/dev/null 2>&1; then
+        echo "$NOW_EPOCH" > "$WEBHOOK_CHECK_MARKER" 2>/dev/null || true
+      else
+        # Can't route this through send_alert -- that would just retry
+        # the same broken webhook. Local-only on purpose.
+        logger -p daemon.warning "reality health-check: webhook delivery check failed -- alerts sent via --set-webhook may not be reaching ${ALERT_WEBHOOK}" 2>/dev/null || true
+        wall "WARNING (xray REALITY): webhook alert delivery check failed. Alerts may not be reaching you -- check the URL or re-run: reality --set-webhook <url>" 2>/dev/null || true
+      fi
+    fi
   fi
 
   exit 0
 fi
+
 
 # ---------------------------------------------------------------------------
 # MODE: --update-core-only  (meant to run unattended on reality-autoupdate.timer)
@@ -926,6 +1171,22 @@ if [[ "$MODE" == "update-core-only" ]]; then
     ok "Xray-core updated: ${BEFORE_XRAY_VERSION} -> ${AFTER_XRAY_VERSION}"
     restart_and_verify
   fi
+
+  # Backup integrity check: confirms the most recent backup's config.json
+  # still passes Xray's own schema validation against whatever binary is
+  # now installed (this check runs right after a possible Xray-core
+  # update, when a schema change -- if one ever happens -- would first
+  # show up). A backup that silently stopped being restorable is only
+  # useful to find out about now, not during an actual emergency restore.
+  if [[ -d "$BACKUP_ROOT" ]] && command -v xray >/dev/null 2>&1; then
+    LATEST_BACKUP_DIR=$(find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort | tail -n1)
+    if [[ -n "$LATEST_BACKUP_DIR" && -f "${LATEST_BACKUP_DIR}/config.json" ]]; then
+      if ! xray run -test -format json -config "${LATEST_BACKUP_DIR}/config.json" >/dev/null 2>&1; then
+        send_alert "update-core: the most recent backup (${LATEST_BACKUP_DIR}) no longer passes Xray's config validation against the currently installed binary. It may not restore cleanly with --restore if you needed it in an emergency -- consider running a plain re-run (reality) to refresh a known-good backup."
+      fi
+    fi
+  fi
+
   exit 0
 fi
 
@@ -1270,7 +1531,15 @@ fi
 
 step "5/10" "Hardening the systemd service"
 mkdir -p /etc/systemd/system/${SERVICE_NAME}.service.d
-cat > /etc/systemd/system/${SERVICE_NAME}.service.d/override.conf <<'EOF'
+OVERRIDE_CONF="/etc/systemd/system/${SERVICE_NAME}.service.d/override.conf"
+# Same "only restart if something actually changed" logic write_config uses
+# for config.json -- otherwise the systemd hardening drop-in gets silently
+# rewritten on every re-run but never actually takes effect until some
+# unrelated later reboot, since the final restart decision only checked
+# CONFIG_CHANGED and the Xray-core version, not this file.
+OVERRIDE_CONF_CHANGED=0
+OVERRIDE_CONF_TMP=$(mktemp)
+cat > "$OVERRIDE_CONF_TMP" <<'EOF'
 [Unit]
 OnFailure=xray-alert.service
 StartLimitIntervalSec=60
@@ -1306,19 +1575,28 @@ RestrictAddressFamilies=AF_INET AF_INET6
 UMask=0077
 EOF
 
+if [[ -f "$OVERRIDE_CONF" ]] && cmp -s "$OVERRIDE_CONF_TMP" "$OVERRIDE_CONF"; then
+  rm -f "$OVERRIDE_CONF_TMP"
+else
+  OVERRIDE_CONF_CHANGED=1
+  mv -f "$OVERRIDE_CONF_TMP" "$OVERRIDE_CONF"
+fi
+
 # OnFailure= above fires once the restart-attempt budget (StartLimitBurst)
 # is exhausted and the service gives up -- not on every individual
-# transient restart. This is local-only (broadcasts to logged-in terminals
-# + a critical syslog entry): there's no email/webhook configured anywhere
-# in this setup, so this can't reach you remotely, only if you're logged
-# into the box or checking logs.
+# transient restart. Routes through the shared send_alert() logic (via
+# `reality --send-alert`) so this reaches the optional webhook too, not
+# just local logger/wall -- see --set-webhook. The /usr/local/bin/reality
+# path is hardcoded rather than looked up: this unit only actually fires
+# later, by which point step 10 below has always installed the shortcut
+# (on both a fresh install and every re-run), so this ordering is safe.
 cat > /etc/systemd/system/xray-alert.service <<'EOF'
 [Unit]
 Description=Local alert when xray.service exhausts its restart attempts
 
 [Service]
 Type=oneshot
-ExecStart=/bin/sh -c 'logger -p daemon.crit "xray.service has FAILED and exhausted its restart attempts -- check: journalctl -u xray -e"; wall "WARNING: xray.service has failed and given up restarting. Check: journalctl -u xray -e" || true'
+ExecStart=/bin/sh -c '/usr/local/bin/reality --send-alert "xray.service has FAILED and exhausted its restart attempts -- check: journalctl -u xray -e" || { logger -p daemon.crit "xray.service has FAILED and exhausted its restart attempts -- check: journalctl -u xray -e"; wall "WARNING: xray.service has failed and given up restarting. Check: journalctl -u xray -e"; }'
 EOF
 
 # Catch unit-file mistakes automatically (e.g. a directive sitting in the
@@ -1545,6 +1823,22 @@ cat > /etc/logrotate.d/xray <<'EOF'
 }
 EOF
 
+# The audit log ($AUDIT_LOG, appended to on every single run/timer tick via
+# the EXIT trap) had no rotation -- low volume per entry, but unbounded
+# over years of a --health-check firing every 10 minutes. Cap it the same
+# way as Xray's own error log.
+cat > /etc/logrotate.d/reality-setup <<EOF
+${AUDIT_LOG} {
+  monthly
+  rotate 6
+  compress
+  delaycompress
+  missingok
+  notifempty
+  copytruncate
+}
+EOF
+
 step "9/10" "Setting up daily reboot at midnight"
 # RandomizedDelaySec below spreads the actual reboot over a ~30min window
 # rather than firing at exactly 00:00:00 -- this script is public, so every
@@ -1681,13 +1975,40 @@ Persistent=true
 WantedBy=timers.target
 EOF
 
+  # Backup maintenance: runs --dedupe-backups on a schedule instead of only
+  # when someone remembers to run it by hand. Low-risk (only ever collapses
+  # consecutive identical-content backups, never touches a genuinely
+  # distinct one -- see --dedupe-backups itself), so safe to leave
+  # unattended.
+  cat > /etc/systemd/system/reality-backup-maintenance.service <<EOF
+[Unit]
+Description=Prune redundant duplicate Xray REALITY backups
+
+[Service]
+Type=oneshot
+ExecStart=${REALITY_SHORTCUT} --dedupe-backups
+EOF
+
+  cat > /etc/systemd/system/reality-backup-maintenance.timer <<'EOF'
+[Unit]
+Description=Weekly backup deduplication
+
+[Timer]
+OnCalendar=weekly
+RandomizedDelaySec=6h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
   systemctl daemon-reload
-  systemctl enable --now reality-watchdog.timer reality-autoupdate.timer >/dev/null 2>&1 || \
-    warn "Could not enable the watchdog/auto-update timers. Check: systemctl status reality-watchdog.timer"
-  ok "Watchdog (every 10min) and auto-update (weekly) timers enabled."
+  systemctl enable --now reality-watchdog.timer reality-autoupdate.timer reality-backup-maintenance.timer >/dev/null 2>&1 || \
+    warn "Could not enable one or more timers. Check: systemctl list-timers 'reality-*'"
+  ok "Watchdog (every 10min), auto-update (weekly), and backup maintenance (weekly) timers enabled."
 else
   REALITY_TIMERS_ENABLED=0
-  warn "Skipping watchdog/auto-update timers -- the 'reality' shortcut isn't in place (see above)."
+  warn "Skipping watchdog/auto-update/backup-maintenance timers -- the 'reality' shortcut isn't in place (see above)."
 fi
 
 # Login summary: surfaces service/firewall/backup state passively on every
@@ -1732,6 +2053,7 @@ if [[ "$REALITY_TIMERS_ENABLED" -eq 1 ]]; then
   echo "Unattended reliability timers are active:"
   echo "  reality-watchdog.timer     -> health check + self-heal restart every 10min"
   echo "  reality-autoupdate.timer   -> Xray-core update check, weekly"
+  echo "  reality-backup-maintenance.timer -> dedupe redundant backups, weekly"
   echo "  (disable either with: systemctl disable --now <name>)"
 fi
 echo ""
@@ -1744,10 +2066,11 @@ echo "  reality --show              -> reprint current client link + QR"
 echo "  reality --status            -> consolidated health/config summary"
 echo "  reality --health-check      -> run the watchdog check manually"
 echo "  reality --update-core-only  -> check/apply an Xray-core update now"
+echo "  reality --set-webhook <url> -> also send critical alerts to a webhook (Slack/ntfy/etc)"
 
 step "final" "Restarting Xray"
 SERVICE_CURRENTLY_ACTIVE=$(systemctl is-active --quiet "${SERVICE_NAME}" && echo 1 || echo 0)
-if [[ "$CONFIG_CHANGED" == "0" ]] && [[ "$BEFORE_XRAY_VERSION" == "$AFTER_XRAY_VERSION" ]] && [[ "$SERVICE_CURRENTLY_ACTIVE" == "1" ]]; then
+if [[ "$CONFIG_CHANGED" == "0" ]] && [[ "$OVERRIDE_CONF_CHANGED" == "0" ]] && [[ "$BEFORE_XRAY_VERSION" == "$AFTER_XRAY_VERSION" ]] && [[ "$SERVICE_CURRENTLY_ACTIVE" == "1" ]]; then
   ok "Nothing changed (config identical, Xray-core unchanged, service already running) -- skipping restart."
   verify_handshake
 else
