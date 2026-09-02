@@ -53,7 +53,7 @@
 #   reality-watchdog.timer      every 10 min  -> --health-check
 #   reality-autoupdate.timer    weekly        -> --update-core-only
 #   reality-backup-maintenance.timer  weekly  -> --dedupe-backups
-# Both are ordinary systemd timers; inspect/disable with the usual
+# All three are ordinary systemd timers; inspect/disable with the usual
 # systemctl commands (e.g. `systemctl disable --now reality-watchdog.timer`).
 #
 # What a full install does:
@@ -191,9 +191,25 @@ trap log_run_outcome EXIT
 # Prevent two concurrent runs (e.g. accidentally launched in two terminals)
 # from racing on the same config/backup/state files. Held for the life of
 # this process; released automatically on exit, including on error.
+#
+# Modes driven by the unattended timers (watchdog every 10min, autoupdate
+# and backup-maintenance weekly) wait briefly for the lock instead of
+# failing immediately -- an interactive/manual run should fail fast on a
+# genuine double-launch, but two automated timers occasionally landing in
+# the same few seconds is expected and shouldn't produce a spurious
+# "failed" entry in the audit log when a short wait would have avoided it.
 LOCK_FILE="/var/lock/reality-setup.lock"
 exec 200>"$LOCK_FILE"
-if ! flock -n 200; then
+LOCK_ACQUIRED=1
+case "$MODE" in
+  health-check|update-core-only|dedupe-backups)
+    flock -w 30 200 || LOCK_ACQUIRED=0
+    ;;
+  *)
+    flock -n 200 || LOCK_ACQUIRED=0
+    ;;
+esac
+if [[ "$LOCK_ACQUIRED" -ne 1 ]]; then
   err "Another run of this script appears to be in progress (lock: ${LOCK_FILE})."
   echo "       Wait for it to finish, or remove the lock file if you're sure nothing" >&2
   echo "       is actually running: rm -f ${LOCK_FILE}" >&2
@@ -205,19 +221,35 @@ if [[ "$MODE" != "install" ]] && ! command -v xray >/dev/null 2>&1; then
   exit 1
 fi
 
-# Non-install modes (rotate/show/restore) rely on jq, openssl, and
-# qrencode, but only ever checked that xray itself exists. If any of
-# these went missing after the initial install, the failure should be a
-# clear message here, not a bare "command not found" partway through.
-if [[ "$MODE" != "install" ]]; then
-  for dep in jq openssl qrencode; do
-    if ! command -v "$dep" >/dev/null 2>&1; then
-      err "Required tool '${dep}' is missing (it should have been installed already)."
-      echo "       Reinstall it with: apt-get install -y ${dep}" >&2
-      exit 1
-    fi
-  done
-fi
+# A handful of non-install modes rely on jq/openssl/qrencode (rotate modes
+# regenerate credentials and print a QR; restore validates JSON), but
+# several others (--status, --health-check, --send-alert, --set-webhook,
+# --list-backups, --dedupe-backups, --update-core-only) don't touch any of
+# these three at all. Gating all of them on all three tools was overly
+# broad -- worst case, it meant --send-alert (the mechanism meant to tell
+# you something is wrong) could itself be blocked by, say, qrencode going
+# missing for an unrelated reason. Check only what each mode actually uses.
+case "$MODE" in
+  rotate-uuid|rotate-all)
+    REQUIRED_DEPS="jq openssl qrencode"
+    ;;
+  show)
+    REQUIRED_DEPS="qrencode"
+    ;;
+  restore)
+    REQUIRED_DEPS="jq"
+    ;;
+  *)
+    REQUIRED_DEPS=""
+    ;;
+esac
+for dep in $REQUIRED_DEPS; do
+  if ! command -v "$dep" >/dev/null 2>&1; then
+    err "Required tool '${dep}' is missing (it should have been installed already)."
+    echo "       Reinstall it with: apt-get install -y ${dep}" >&2
+    exit 1
+  fi
+done
 
 if [[ "$MODE" == "install" ]] && ! command -v apt-get >/dev/null 2>&1; then
   err "This script only supports Debian/Ubuntu (apt-based) systems."
@@ -737,7 +769,20 @@ EOF
   echo "${vless_link}"
   echo ""
   echo "QR code:"
-  qrencode -t ansiutf8 "${vless_link}"
+  # Guarded rather than a bare call: this runs before the caller's
+  # restart_and_verify (see finish_and_restart) in the rotate-uuid/
+  # rotate-all/install flows. An unguarded failure here (e.g. qrencode
+  # missing) would abort under `set -e` right at this display step --
+  # after new credentials are already written to config.json and this
+  # file, but *before* Xray has actually been restarted to pick them up,
+  # leaving the running service on old credentials while the file on disk
+  # claims new ones. A terminal QR code is worth skipping gracefully, not
+  # worth risking that inconsistency over.
+  if command -v qrencode >/dev/null 2>&1; then
+    qrencode -t ansiutf8 "${vless_link}" || warn "qrencode failed to render the terminal QR code (the PNG above and the link/text file are unaffected)."
+  else
+    warn "qrencode not found -- skipping the terminal QR code (the link above still works, and a PNG may have been saved next to ${CLIENT_INFO_FILE})."
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -964,6 +1009,7 @@ fi
 # ---------------------------------------------------------------------------
 if [[ "$MODE" == "health-check" ]]; then
   HEALTH_ISSUE=""
+  HEALTH_EXIT_CODE=0
 
   if ! systemctl is-active --quiet "${SERVICE_NAME}"; then
     HEALTH_ISSUE="service not active"
@@ -1052,7 +1098,13 @@ if [[ "$MODE" == "health-check" ]]; then
       alert_on_transition "service-down" 1 \
         "health-check: xray.service still unhealthy after a restart attempt (${HEALTH_ISSUE}). Check: journalctl -u xray -e" ""
       err "Health check failed and self-heal restart did not resolve it: ${HEALTH_ISSUE}"
-      exit 1
+      # Deliberately not exiting here -- a broken service is exactly when
+      # the checks below (disk, drift, clock, SNI, reboot-required,
+      # webhook delivery) are most useful for troubleshooting, and while
+      # this stays broken every subsequent 10-minute tick would otherwise
+      # exit before ever reaching them again. Exit code is set now and
+      # applied at the very end, after everything has run.
+      HEALTH_EXIT_CODE=1
     else
       alert_on_transition "service-down" 0 "" "xray.service is healthy again after a restart"
       logger -p daemon.notice "reality health-check: restart resolved the issue (${HEALTH_ISSUE})" 2>/dev/null || true
@@ -1125,9 +1177,8 @@ if [[ "$MODE" == "health-check" ]]; then
     fi
   fi
 
-  exit 0
+  exit "$HEALTH_EXIT_CODE"
 fi
-
 
 # ---------------------------------------------------------------------------
 # MODE: --update-core-only  (meant to run unattended on reality-autoupdate.timer)
@@ -1165,26 +1216,28 @@ if [[ "$MODE" == "update-core-only" ]]; then
   date +%s > "${XRAY_CONFIG_DIR}/.last-xray-checkupdate"
   AFTER_XRAY_VERSION=$(xray version 2>/dev/null | head -n1 || echo "none")
 
-  if [[ "$BEFORE_XRAY_VERSION" == "$AFTER_XRAY_VERSION" ]]; then
-    ok "Xray-core already current (${AFTER_XRAY_VERSION}) -- no restart needed."
-  else
-    ok "Xray-core updated: ${BEFORE_XRAY_VERSION} -> ${AFTER_XRAY_VERSION}"
-    restart_and_verify
-  fi
-
-  # Backup integrity check: confirms the most recent backup's config.json
-  # still passes Xray's own schema validation against whatever binary is
-  # now installed (this check runs right after a possible Xray-core
-  # update, when a schema change -- if one ever happens -- would first
-  # show up). A backup that silently stopped being restorable is only
-  # useful to find out about now, not during an actual emergency restore.
-  if [[ -d "$BACKUP_ROOT" ]] && command -v xray >/dev/null 2>&1; then
+  # Backup integrity check runs before the restart below -- it doesn't
+  # depend on the restart succeeding, and restart_and_verify exits the
+  # script on failure, which would otherwise skip this check entirely on
+  # exactly the run where a schema change is most likely to have just
+  # happened. Confirms the most recent backup's config.json still passes
+  # Xray's own schema validation against whatever binary is now installed.
+  # A backup that silently stopped being restorable is only useful to
+  # find out about now, not during an actual emergency restore.
+  if [[ -d "$BACKUP_ROOT" ]]; then
     LATEST_BACKUP_DIR=$(find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort | tail -n1)
     if [[ -n "$LATEST_BACKUP_DIR" && -f "${LATEST_BACKUP_DIR}/config.json" ]]; then
       if ! xray run -test -format json -config "${LATEST_BACKUP_DIR}/config.json" >/dev/null 2>&1; then
         send_alert "update-core: the most recent backup (${LATEST_BACKUP_DIR}) no longer passes Xray's config validation against the currently installed binary. It may not restore cleanly with --restore if you needed it in an emergency -- consider running a plain re-run (reality) to refresh a known-good backup."
       fi
     fi
+  fi
+
+  if [[ "$BEFORE_XRAY_VERSION" == "$AFTER_XRAY_VERSION" ]]; then
+    ok "Xray-core already current (${AFTER_XRAY_VERSION}) -- no restart needed."
+  else
+    ok "Xray-core updated: ${BEFORE_XRAY_VERSION} -> ${AFTER_XRAY_VERSION}"
+    restart_and_verify
   fi
 
   exit 0
@@ -2054,7 +2107,7 @@ if [[ "$REALITY_TIMERS_ENABLED" -eq 1 ]]; then
   echo "  reality-watchdog.timer     -> health check + self-heal restart every 10min"
   echo "  reality-autoupdate.timer   -> Xray-core update check, weekly"
   echo "  reality-backup-maintenance.timer -> dedupe redundant backups, weekly"
-  echo "  (disable either with: systemctl disable --now <name>)"
+  echo "  (disable any of them with: systemctl disable --now <name>)"
 fi
 echo ""
 echo "Re-run any time (works via either name, from any directory):"
