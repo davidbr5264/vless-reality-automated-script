@@ -91,8 +91,40 @@ err()  { echo "  ERROR: $1" >&2; }
 # ---------------------------------------------------------------------------
 # Configuration (edit if needed, or override via environment variables)
 # ---------------------------------------------------------------------------
-SNI_DOMAIN_DEFAULT="${SNI_DOMAIN:-i.ytimg.com}"   # REALITY camouflage target
+SNI_DOMAIN_ENV_OVERRIDE="${SNI_DOMAIN:-}"
+# Pool of conservative, well-established Google/YouTube-owned static-asset
+# subdomains -- same risk profile as the original single default (TLS1.3,
+# not a mega-CDN edge like google.com/microsoft.com itself, low anti-bot
+# friction), but randomized per fresh install so every install of this
+# public script doesn't converge on one identical, easily-cataloged SNI.
+# Live-verified below regardless (see the SNI check further down, which
+# now also runs for non-interactive installs, not just interactive ones)
+# and always overridable -- interactively, via SNI_DOMAIN=..., or later
+# via --rotate-all.
+#
+# Note on googlevideo.com specifically: unlike ytimg.com/youtube.com, it
+# doesn't have a stable, fixed public hostname for actual video delivery --
+# that traffic goes through ephemeral, per-session redirector subdomains
+# (e.g. rr3---sn-xxxx.googlevideo.com) assigned at request time, which
+# aren't suitable as a fixed REALITY target. redirector.googlevideo.com is
+# included as the closest thing to a stable entry point, but if it doesn't
+# pass the live TLS1.3 check on a given host, the fallback logic below just
+# moves on to the next pool candidate -- same as any other candidate that
+# doesn't verify.
+SNI_POOL=(i.ytimg.com s.ytimg.com www.youtube.com redirector.googlevideo.com)
+if [[ -n "$SNI_DOMAIN_ENV_OVERRIDE" ]]; then
+  SNI_DOMAIN_DEFAULT="$SNI_DOMAIN_ENV_OVERRIDE"
+else
+  SNI_DOMAIN_DEFAULT="${SNI_POOL[$((RANDOM % ${#SNI_POOL[@]}))]}"
+fi
 LISTEN_PORT_DEFAULT="${LISTEN_PORT:-443}"         # Xray listen port
+# uTLS ClientHello fingerprint the client presents. "random" rotates it
+# per-connection rather than always presenting an identical "chrome"
+# fingerprint on every single handshake -- a static fingerprint is itself
+# a pattern an observer could key on across many connections/servers.
+# Persisted in state like SNI/port once set, so re-runs stay consistent
+# rather than changing under you.
+FINGERPRINT_DEFAULT="${FINGERPRINT:-random}"
 # Used as a fallback to install the 'reality' shortcut when this script is
 # run via a process substitution / pipe (e.g. `bash <(curl -Ls ...)`),
 # where $0 doesn't point to an actual file on disk. Override via env var
@@ -275,6 +307,7 @@ fi
 # ---------------------------------------------------------------------------
 SNI_DOMAIN="$SNI_DOMAIN_DEFAULT"
 LISTEN_PORT="$LISTEN_PORT_DEFAULT"
+FINGERPRINT="$FINGERPRINT_DEFAULT"
 UUID=""
 PRIVATE_KEY=""
 PUBLIC_KEY=""
@@ -291,8 +324,13 @@ if [[ -f "$STATE_FILE" ]]; then
   # shellcheck disable=SC1090
   source "$STATE_FILE"
 
-  if [[ "$SNI_DOMAIN_DEFAULT" != "i.ytimg.com" && "$SNI_DOMAIN_DEFAULT" != "$SNI_DOMAIN" ]]; then
-    warn "SNI_DOMAIN env var ('${SNI_DOMAIN_DEFAULT}') was set, but an existing install already"
+  # Only warn when the person actually set the env var themselves --
+  # comparing against the pool-randomized default (rather than a fixed
+  # sentinel string) would otherwise false-positive on every re-run purely
+  # because this run's random pick differs from both "i.ytimg.com" and
+  # whatever the existing install already uses.
+  if [[ -n "$SNI_DOMAIN_ENV_OVERRIDE" && "$SNI_DOMAIN_ENV_OVERRIDE" != "$SNI_DOMAIN" ]]; then
+    warn "SNI_DOMAIN env var ('${SNI_DOMAIN_ENV_OVERRIDE}') was set, but an existing install already"
     echo "         uses '${SNI_DOMAIN}' -- existing state always wins, so the env var was ignored." >&2
     echo "         There's no way to change just the SNI without --rotate-all (full reset)." >&2
   fi
@@ -300,6 +338,10 @@ if [[ -f "$STATE_FILE" ]]; then
     warn "LISTEN_PORT env var ('${LISTEN_PORT_DEFAULT}') was set, but an existing install already"
     echo "         uses port ${LISTEN_PORT} -- existing state always wins, so the env var was ignored." >&2
   fi
+  # FINGERPRINT was added to state after this script's initial release, so
+  # an older install re-running this newer version may have no saved value
+  # yet -- fall back to the default rather than leaving it empty.
+  [[ -z "$FINGERPRINT" ]] && FINGERPRINT="$FINGERPRINT_DEFAULT"
 fi
 
 if [[ "$MODE" == "show" ]]; then
@@ -545,6 +587,7 @@ save_state() {
   cat > "$tmp_state" <<EOF
 SNI_DOMAIN="${SNI_DOMAIN}"
 LISTEN_PORT="${LISTEN_PORT}"
+FINGERPRINT="${FINGERPRINT}"
 UUID="${UUID}"
 PRIVATE_KEY="${PRIVATE_KEY}"
 PUBLIC_KEY="${PUBLIC_KEY}"
@@ -671,6 +714,27 @@ alert_on_transition() {
 }
 
 # ---------------------------------------------------------------------------
+# Helper: record the currently installed xray binary's checksum, called
+# right after a legitimate install/update (step 2 of a full install, and
+# --update-core-only). --health-check later compares against this to catch
+# the binary changing through any OTHER path (tampering, a botched manual
+# update, disk corruption) -- the same class of integrity check already
+# done for config.json, extended to the binary itself. Also doubles as a
+# lightweight supply-chain audit trail: logs what was actually installed,
+# not just that a version string changed, so "what binary was running on
+# such-and-such date" is answerable later from the log alone.
+# ---------------------------------------------------------------------------
+record_xray_binary_checksum() {
+  local xray_path checksum
+  xray_path=$(command -v xray 2>/dev/null) || return 0
+  checksum=$(sha256sum "$xray_path" 2>/dev/null | awk '{print $1}')
+  [[ -z "$checksum" ]] && return 0
+  echo "$checksum" > "${XRAY_CONFIG_DIR}/.xray-binary.sha256" 2>/dev/null || true
+  chmod 600 "${XRAY_CONFIG_DIR}/.xray-binary.sha256" 2>/dev/null || true
+  echo "$(date -Is) xray_binary_sha256=${checksum} xray_path=${xray_path} version=$(xray version 2>/dev/null | head -n1)" >> "$AUDIT_LOG" 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
 # Helper: build vless:// link, write client info file, print summary + QR
 # ---------------------------------------------------------------------------
 output_client_info() {
@@ -712,7 +776,7 @@ output_client_info() {
     fi
   fi
 
-  local vless_link="vless://${UUID}@${server_ip}:${LISTEN_PORT}?type=tcp&security=reality&pbk=${PUBLIC_KEY}&fp=chrome&sni=${SNI_DOMAIN}&sid=${SHORT_ID}&flow=xtls-rprx-vision&spx=%2F#xray-reality-$(hostname)"
+  local vless_link="vless://${UUID}@${server_ip}:${LISTEN_PORT}?type=tcp&security=reality&pbk=${PUBLIC_KEY}&fp=${FINGERPRINT}&sni=${SNI_DOMAIN}&sid=${SHORT_ID}&flow=xtls-rprx-vision&spx=%2F#xray-reality-$(hostname)"
 
   # Write via mktemp (created 0600 by default) + atomic rename, rather than
   # `cat > "$CLIENT_INFO_FILE"` followed by a separate chmod -- the latter
@@ -732,7 +796,7 @@ SNI (dest)    : ${SNI_DOMAIN}
 Public Key    : ${PUBLIC_KEY}
 Private Key   : ${PRIVATE_KEY}   (server-side only, keep secret)
 Short ID      : ${SHORT_ID}
-Fingerprint   : chrome
+Fingerprint   : ${FINGERPRINT}
 
 Client import link:
 ${vless_link}
@@ -1033,6 +1097,24 @@ if [[ "$MODE" == "health-check" ]]; then
     fi
   fi
 
+  # Binary integrity check: same idea as config-drift, but for the xray
+  # binary itself. A mismatch means the installed binary changed through
+  # some path other than this script's own install/--update-core-only
+  # (tampering, a manual replace, disk corruption) -- worth knowing about
+  # regardless of whether the running service still looks healthy.
+  BINARY_DRIFT=0
+  XRAY_BINARY_HASH_FILE="${XRAY_CONFIG_DIR}/.xray-binary.sha256"
+  if [[ -f "$XRAY_BINARY_HASH_FILE" ]]; then
+    XRAY_PATH_NOW=$(command -v xray 2>/dev/null || true)
+    if [[ -n "$XRAY_PATH_NOW" ]]; then
+      RECORDED_BINARY_HASH=$(cat "$XRAY_BINARY_HASH_FILE" 2>/dev/null || true)
+      CURRENT_BINARY_HASH=$(sha256sum "$XRAY_PATH_NOW" 2>/dev/null | awk '{print $1}')
+      if [[ -n "$RECORDED_BINARY_HASH" && -n "$CURRENT_BINARY_HASH" && "$RECORDED_BINARY_HASH" != "$CURRENT_BINARY_HASH" ]]; then
+        BINARY_DRIFT=1
+      fi
+    fi
+  fi
+
   # Low-disk check: apt upgrades, xray-core updates, logs, and backups all
   # need headroom -- catching this here means "disk full" gets flagged on
   # its own well before it manifests as some other, more confusing failure
@@ -1071,7 +1153,7 @@ if [[ "$MODE" == "health-check" ]]; then
   REBOOT_REQUIRED=0
   [[ -f /var/run/reboot-required ]] && REBOOT_REQUIRED=1
 
-  if [[ -z "$HEALTH_ISSUE" && "$DRIFT_DETECTED" -eq 0 && "$LOW_DISK" -eq 0 && "$CLOCK_DRIFT" -eq 0 && "$SNI_BROKEN" -eq 0 && "$REBOOT_REQUIRED" -eq 0 ]]; then
+  if [[ -z "$HEALTH_ISSUE" && "$DRIFT_DETECTED" -eq 0 && "$BINARY_DRIFT" -eq 0 && "$LOW_DISK" -eq 0 && "$CLOCK_DRIFT" -eq 0 && "$SNI_BROKEN" -eq 0 && "$REBOOT_REQUIRED" -eq 0 ]]; then
     # Healthy and quiet -- this mode is designed to run every few minutes
     # unattended, so success prints nothing and just exits 0. Clear any
     # stale "service-down" marker from a previous unhealthy run (e.g. it
@@ -1117,6 +1199,13 @@ if [[ "$MODE" == "health-check" ]]; then
       "health-check: ${CONFIG_FILE} does not match the last known-good checksum -- possible unexpected change. If you didn't hand-edit it, investigate." ""
   else
     alert_on_transition "config-drift" 0 "" ""
+  fi
+
+  if [[ "$BINARY_DRIFT" -eq 1 ]]; then
+    alert_on_transition "binary-drift" 1 \
+      "health-check: the installed xray binary (${XRAY_PATH_NOW}) does not match the checksum recorded after the last legitimate install/update. This could mean tampering, a manual replace, or disk corruption -- worth investigating before trusting this instance." ""
+  else
+    alert_on_transition "binary-drift" 0 "" "xray binary checksum matches the recorded known-good value again"
   fi
 
   if [[ "$LOW_DISK" -eq 1 ]]; then
@@ -1215,6 +1304,7 @@ if [[ "$MODE" == "update-core-only" ]]; then
 
   date +%s > "${XRAY_CONFIG_DIR}/.last-xray-checkupdate"
   AFTER_XRAY_VERSION=$(xray version 2>/dev/null | head -n1 || echo "none")
+  record_xray_binary_checksum
 
   # Backup integrity check runs before the restart below -- it doesn't
   # depend on the restart succeeding, and restart_and_verify exits the
@@ -1438,6 +1528,34 @@ if [[ -z "$UUID" ]] && [[ -t 0 ]]; then
   echo "Using: ${SNI_DOMAIN}"
 fi
 
+# Non-interactive first installs (piped/scripted/automated) previously
+# skipped SNI verification entirely -- the live TLS1.3 check above only
+# ever ran inside the interactive prompt loop. That left the (now
+# pool-randomized) default entirely unverified for anyone running this via
+# `bash <(curl ...)` non-interactively or through automation. Do the same
+# live check here, falling through the rest of the pool and finally to the
+# original i.ytimg.com default if every candidate fails, rather than
+# silently proceeding with something REALITY might not actually work
+# against.
+if [[ -z "$UUID" ]] && [[ ! -t 0 ]] && command -v openssl >/dev/null 2>&1; then
+  SNI_VERIFIED=0
+  for candidate in "$SNI_DOMAIN" "${SNI_POOL[@]}" "i.ytimg.com"; do
+    if timeout 6 openssl s_client -connect "${candidate}:443" -servername "${candidate}" -tls1_3 </dev/null >/dev/null 2>&1; then
+      if [[ "$candidate" != "$SNI_DOMAIN" ]]; then
+        warn "SNI target '${SNI_DOMAIN}' didn't verify; using '${candidate}' instead (first pool candidate that passed a live TLS1.3 check)."
+      fi
+      SNI_DOMAIN="$candidate"
+      SNI_VERIFIED=1
+      break
+    fi
+  done
+  if [[ "$SNI_VERIFIED" -ne 1 ]]; then
+    warn "Could not verify TLS1.3 on port 443 for any SNI candidate (network issue during install?)."
+    echo "         Proceeding with '${SNI_DOMAIN}' unverified -- if the tunnel doesn't work," >&2
+    echo "         check connectivity and reconsider the SNI with --rotate-all." >&2
+  fi
+fi
+
 step "1/10" "Preparing server (updates, cleanup, essential tools)"
 export DEBIAN_FRONTEND=noninteractive
 # -o DPkg::Lock::Timeout=300: fresh VPS instances commonly have
@@ -1526,6 +1644,7 @@ else
 fi
 
 AFTER_XRAY_VERSION=$(xray version 2>/dev/null | head -n1 || echo "none")
+record_xray_binary_checksum
 
 step "3/10" "Setting up credentials (UUID, REALITY keypair, short ID)"
 if [[ -n "$UUID" && -n "$PRIVATE_KEY" && -n "$PUBLIC_KEY" && -n "$SHORT_ID" ]]; then
