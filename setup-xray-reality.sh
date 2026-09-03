@@ -144,7 +144,7 @@ FINGERPRINT_DEFAULT="${FINGERPRINT:-random}"
 # run via a process substitution / pipe (e.g. `bash <(curl -Ls ...)`),
 # where $0 doesn't point to an actual file on disk. Override via env var
 # if you're running a fork of this script from a different location.
-SCRIPT_SOURCE_URL="${SCRIPT_SOURCE_URL:-https://raw.githubusercontent.com/davidbr5264/VLESS-TCP-XTLS-Vision-REALITY-automated-script/master/setup-xray-reality.sh}"
+SCRIPT_SOURCE_URL="${SCRIPT_SOURCE_URL:-https://raw.githubusercontent.com/davidbr5264/vless-reality-automated-script/master/setup-xray-reality.sh}"
 XRAY_CONFIG_DIR="/usr/local/etc/xray"
 CONFIG_FILE="${XRAY_CONFIG_DIR}/config.json"
 STATE_FILE="${XRAY_CONFIG_DIR}/.reality-state"    # remembers settings between runs
@@ -232,6 +232,23 @@ log_run_outcome() {
   local outcome="success"
   [[ "$exit_code" -ne 0 ]] && outcome="failed(exit ${exit_code})"
   echo "$(date -Is) mode=${MODE} outcome=${outcome}" >> "$AUDIT_LOG" 2>/dev/null || true
+
+  # For install mode specifically -- the one-shot "did my unattended
+  # deployment actually work" moment, e.g. a cloud-init/DigitalOcean
+  # runcmd on first boot with no one watching -- notify a configured
+  # webhook of the outcome directly here, rather than through send_alert().
+  # This trap can fire from a very early failure (preflight checks, before
+  # send_alert's own function definition is even reached during normal
+  # top-to-bottom script execution), so it stays self-contained and
+  # dependency-free instead of risking "command not found" on an early
+  # exit. Deliberately minimal: no private info, just host + outcome.
+  if [[ "${MODE:-}" == "install" && -n "${ALERT_WEBHOOK:-}" ]] && command -v curl >/dev/null 2>&1; then
+    local host_now
+    host_now=$(hostname 2>/dev/null || echo "unknown-host")
+    curl -fsS --max-time 10 -X POST -H "Content-Type: application/json" \
+      -d "{\"host\":\"${host_now}\",\"message\":\"reality install finished: ${outcome}\"}" \
+      "$ALERT_WEBHOOK" >/dev/null 2>&1 || true
+  fi
 }
 trap log_run_outcome EXIT
 
