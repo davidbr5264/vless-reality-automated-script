@@ -61,7 +61,8 @@
 #   2. Installs latest official Xray-core (XTLS/Xray-install)
 #   3. Generates UUID, REALITY x25519 keypair, and a short ID
 #   4. Writes a minimal-logging config.json (VLESS + TCP + XTLS-Vision + REALITY)
-#      camouflaged as a real site (default: i.ytimg.com)
+#      camouflaged as a real site (randomly picked from a small pool of
+#      YouTube/Google-owned domains, live-verified -- see SNI_POOL below)
 #   5. Locks the systemd unit down (NoNewPrivileges, ProtectSystem, etc.)
 #   6. Configures UFW (only SSH + Xray port open) and fail2ban for sshd
 #   7. Enables BBR + fq congestion control, applies basic sysctl hardening
@@ -73,6 +74,20 @@
 # Re-running (install or any --rotate mode) automatically backs up the
 # previous config + client info under /root/xray-backups/<timestamp>/
 # before making changes, so nothing is silently lost.
+#
+# Environment variable overrides (only take effect on a genuinely
+# first-time install -- once state exists, re-runs always keep whatever's
+# already saved, and a mismatched env var just prints a warning that it
+# was ignored rather than silently changing a running install):
+#   SNI_DOMAIN            REALITY camouflage target (default: random pick
+#                          from SNI_POOL, live-verified)
+#   LISTEN_PORT            Xray listen port (default: 443)
+#   FINGERPRINT            uTLS ClientHello fingerprint (default: random)
+#   REALITY_ALERT_WEBHOOK  webhook URL for critical alerts (default: unset;
+#                          same as running --set-webhook <url> after install)
+#   SCRIPT_SOURCE_URL      where the self-update check and 'reality'
+#                          shortcut fallback re-download from (default:
+#                          this script's own GitHub repo)
 #
 set -euo pipefail
 
@@ -176,7 +191,7 @@ case "${1:-}" in
     fi
     ;;
   --help|-h)
-    sed -n '2,76p' "$0"
+    sed -n '2,91p' "$0"
     exit 0
     ;;
   "") ;;
@@ -1482,7 +1497,9 @@ fi
 # Only prompt for a custom SNI on a genuinely first-time install (no UUID
 # yet means no existing state) and only when there's an actual interactive
 # terminal to prompt on -- piped/scripted/non-interactive runs just fall
-# through to the existing default (env var override, or i.ytimg.com).
+# through to the existing default (env var override, or the pool-randomized
+# pick from SNI_POOL -- see the non-interactive verification block further
+# down for how that gets checked too).
 if [[ -z "$UUID" ]] && [[ -t 0 ]]; then
   while true; do
     echo ""
@@ -2189,7 +2206,7 @@ fi
 mkdir -p /etc/update-motd.d
 cat > /etc/update-motd.d/99-xray-reality <<EOF
 #!/bin/sh
-${REALITY_SHORTCUT} --status 2>/dev/null | head -n 10
+${REALITY_SHORTCUT} --status 2>/dev/null | head -n 20
 EOF
 chmod +x /etc/update-motd.d/99-xray-reality
 
