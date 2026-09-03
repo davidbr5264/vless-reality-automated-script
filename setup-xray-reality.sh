@@ -107,7 +107,7 @@ err()  { echo "  ERROR: $1" >&2; }
 # Configuration (edit if needed, or override via environment variables)
 # ---------------------------------------------------------------------------
 SNI_DOMAIN_ENV_OVERRIDE="${SNI_DOMAIN:-}"
-# Pool of conservative, well-established Google/YouTube-owned static-asset
+# Pool of conservative, well-established YouTube/Google-owned static-asset
 # subdomains -- same risk profile as the original single default (TLS1.3,
 # not a mega-CDN edge like google.com/microsoft.com itself, low anti-bot
 # friction), but randomized per fresh install so every install of this
@@ -117,16 +117,13 @@ SNI_DOMAIN_ENV_OVERRIDE="${SNI_DOMAIN:-}"
 # and always overridable -- interactively, via SNI_DOMAIN=..., or later
 # via --rotate-all.
 #
-# Note on googlevideo.com specifically: unlike ytimg.com/youtube.com, it
-# doesn't have a stable, fixed public hostname for actual video delivery --
-# that traffic goes through ephemeral, per-session redirector subdomains
-# (e.g. rr3---sn-xxxx.googlevideo.com) assigned at request time, which
-# aren't suitable as a fixed REALITY target. redirector.googlevideo.com is
-# included as the closest thing to a stable entry point, but if it doesn't
-# pass the live TLS1.3 check on a given host, the fallback logic below just
-# moves on to the next pool candidate -- same as any other candidate that
-# doesn't verify.
-SNI_POOL=(i.ytimg.com s.ytimg.com www.youtube.com redirector.googlevideo.com)
+# Deliberately excludes anything under googlevideo.com: unlike ytimg.com/
+# youtube.com, it has no stable, fixed public hostname for actual video
+# delivery -- that traffic goes through ephemeral, per-session redirector
+# subdomains (e.g. rr1---sn-xxxx.googlevideo.com) assigned at request time
+# to a specific edge node, which can be reassigned or stop resolving at any
+# point with no warning. Not a fit for a fixed REALITY target.
+SNI_POOL=(i.ytimg.com s.ytimg.com www.youtube.com)
 if [[ -n "$SNI_DOMAIN_ENV_OVERRIDE" ]]; then
   SNI_DOMAIN_DEFAULT="$SNI_DOMAIN_ENV_OVERRIDE"
 else
