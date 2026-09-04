@@ -206,23 +206,18 @@ for arg in "$@"; do
   [[ "$arg" == "--force" || "$arg" == "--yes" ]] && FORCE_CONFIRM=1
 done
 
-if ! [[ "$LISTEN_PORT_DEFAULT" =~ ^[0-9]+$ ]] || [[ "$LISTEN_PORT_DEFAULT" -lt 1 ]] || [[ "$LISTEN_PORT_DEFAULT" -gt 65535 ]]; then
-  err "LISTEN_PORT must be a number between 1 and 65535 (got: '${LISTEN_PORT_DEFAULT}')."
-  exit 1
-fi
-
-# ---------------------------------------------------------------------------
-# Preflight checks
-# ---------------------------------------------------------------------------
-if [[ $EUID -ne 0 ]]; then
-  err "This script must be run as root (use sudo)."
-  exit 1
-fi
-
 # One line per run, appended on every exit path (success, error, or an
 # early exit deep in some step) via the EXIT trap -- so "when did I last
 # touch this, and did it work" is answerable later without guessing from
 # backup timestamps alone (which get pruned).
+#
+# Registered here -- right after MODE is resolved and before the
+# LISTEN_PORT/root preflight checks below -- rather than further down,
+# specifically so a bad LISTEN_PORT env var or a not-run-as-root invocation
+# also gets logged and, for install mode, notified via webhook if
+# configured. Those are exactly the kind of environment-misconfiguration
+# failures a headless deployment (e.g. a cloud-init runcmd with a typo'd
+# env var) would otherwise fail completely silently on.
 AUDIT_LOG="/var/log/reality-setup.log"
 log_run_outcome() {
   local exit_code=$?
@@ -248,6 +243,19 @@ log_run_outcome() {
   fi
 }
 trap log_run_outcome EXIT
+
+if ! [[ "$LISTEN_PORT_DEFAULT" =~ ^[0-9]+$ ]] || [[ "$LISTEN_PORT_DEFAULT" -lt 1 ]] || [[ "$LISTEN_PORT_DEFAULT" -gt 65535 ]]; then
+  err "LISTEN_PORT must be a number between 1 and 65535 (got: '${LISTEN_PORT_DEFAULT}')."
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Preflight checks
+# ---------------------------------------------------------------------------
+if [[ $EUID -ne 0 ]]; then
+  err "This script must be run as root (use sudo)."
+  exit 1
+fi
 
 # Prevent two concurrent runs (e.g. accidentally launched in two terminals)
 # from racing on the same config/backup/state files. Held for the life of
@@ -1564,13 +1572,12 @@ fi
 # ever ran inside the interactive prompt loop. That left the (now
 # pool-randomized) default entirely unverified for anyone running this via
 # `bash <(curl ...)` non-interactively or through automation. Do the same
-# live check here, falling through the rest of the pool and finally to the
-# original i.ytimg.com default if every candidate fails, rather than
-# silently proceeding with something REALITY might not actually work
-# against.
+# live check here, falling through the rest of the pool if the picked
+# candidate fails, rather than silently proceeding with something REALITY
+# might not actually work against.
 if [[ -z "$UUID" ]] && [[ ! -t 0 ]] && command -v openssl >/dev/null 2>&1; then
   SNI_VERIFIED=0
-  for candidate in "$SNI_DOMAIN" "${SNI_POOL[@]}" "i.ytimg.com"; do
+  for candidate in "$SNI_DOMAIN" "${SNI_POOL[@]}"; do
     if timeout 6 openssl s_client -connect "${candidate}:443" -servername "${candidate}" -tls1_3 </dev/null >/dev/null 2>&1; then
       if [[ "$candidate" != "$SNI_DOMAIN" ]]; then
         warn "SNI target '${SNI_DOMAIN}' didn't verify; using '${candidate}' instead (first pool candidate that passed a live TLS1.3 check)."
