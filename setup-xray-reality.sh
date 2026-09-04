@@ -24,6 +24,24 @@
 #                                           --force to skip it). Still
 #                                           invalidates existing client links
 #                                           (server name has to match).
+#   ./setup-xray-reality.sh --change-fingerprint <value>
+#                                           Change the client uTLS fingerprint
+#                                           (chrome/firefox/safari/ios/
+#                                           android/edge/360/qq/random/
+#                                           randomized). No restart -- purely
+#                                           client-side, the server doesn't
+#                                           validate it. Just re-import the
+#                                           reprinted link to use the new one.
+#   ./setup-xray-reality.sh --change-port [port]
+#                                           Change only the listen port --
+#                                           keeps UUID, short ID, and keypair
+#                                           unchanged. Updates UFW safely: new
+#                                           port's rule is added before the
+#                                           old one is removed, and the old
+#                                           rule is only removed after Xray
+#                                           is confirmed healthy on the new
+#                                           port, so a failed restart never
+#                                           leaves you locked out.
 #   ./setup-xray-reality.sh --show         Reprint the current client link/QR
 #                                           without changing anything
 #   ./setup-xray-reality.sh --list-backups List available backups with timestamps
@@ -176,6 +194,14 @@ case "${1:-}" in
     MODE="change-sni"
     NEW_SNI_ARG="${2:-}"
     ;;
+  --change-fingerprint)
+    MODE="change-fingerprint"
+    NEW_FP_ARG="${2:-}"
+    ;;
+  --change-port)
+    MODE="change-port"
+    NEW_PORT_ARG="${2:-}"
+    ;;
   --show)          MODE="show" ;;
   --list-backups)  MODE="list-backups" ;;
   --dedupe-backups) MODE="dedupe-backups" ;;
@@ -203,7 +229,7 @@ case "${1:-}" in
     fi
     ;;
   --help|-h)
-    sed -n '2,102p' "$0"
+    sed -n '2,120p' "$0"
     exit 0
     ;;
   "") ;;
@@ -317,8 +343,11 @@ case "$MODE" in
   rotate-uuid|rotate-all|change-sni)
     REQUIRED_DEPS="jq openssl qrencode"
     ;;
-  show)
+  show|change-fingerprint)
     REQUIRED_DEPS="qrencode"
+    ;;
+  change-port)
+    REQUIRED_DEPS="jq qrencode"
     ;;
   restore)
     REQUIRED_DEPS="jq"
@@ -1073,6 +1102,8 @@ if [[ "$MODE" == "status" ]]; then
   echo "=== Xray REALITY status ==="
   echo ""
   echo "Service (${SERVICE_NAME})   : ${SERVICE_STATE}"
+  echo "SNI (dest)          : ${SNI_DOMAIN:-unknown}"
+  echo "Listen port         : ${LISTEN_PORT:-unknown}"
   echo "Congestion control  : ${ACTIVE_CC} $( [[ "$ACTIVE_CC" != "bbr" ]] && echo "(expected bbr)" )"
   if [[ -n "$PRIMARY_IFACE" ]]; then
     echo "qdisc (${PRIMARY_IFACE})       : ${CURRENT_QDISC:-unknown} $( [[ "$CURRENT_QDISC" != "fq" ]] && echo "(expected fq)" )"
@@ -1545,6 +1576,130 @@ if [[ "$MODE" == "change-sni" ]]; then
   finish_and_restart
   echo ""
   echo "Old client link is now invalid (REALITY serverName mismatch)."
+  echo "Any device using it must import the new link above."
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# MODE: --change-fingerprint <value>  (client-side uTLS fingerprint only)
+#
+# Unlike --change-sni, this never touches config.json or the running xray
+# process at all -- fp is purely advisory for how the CLIENT constructs its
+# TLS ClientHello. The server doesn't validate or store it, so there's
+# nothing to restart. Just updates state and reprints the link with the new
+# value. Existing client links using the old fingerprint keep working too
+# (fp only affects the connecting side's handshake shape, not what the
+# server accepts) -- but you'd re-import to actually pick up the new value.
+# ---------------------------------------------------------------------------
+if [[ "$MODE" == "change-fingerprint" ]]; then
+  if [[ -z "$UUID" ]]; then
+    err "No existing install found (${STATE_FILE}). Run a full install first."
+    exit 1
+  fi
+
+  VALID_FINGERPRINTS="chrome firefox safari ios android edge 360 qq random randomized"
+  NEW_FP="$NEW_FP_ARG"
+  if [[ -z "$NEW_FP" ]]; then
+    err "Usage: reality --change-fingerprint <value>"
+    echo "       Valid values: ${VALID_FINGERPRINTS}" >&2
+    exit 1
+  fi
+  if [[ " ${VALID_FINGERPRINTS} " != *" ${NEW_FP} "* ]]; then
+    err "Unknown fingerprint '${NEW_FP}'."
+    echo "       Valid values: ${VALID_FINGERPRINTS}" >&2
+    exit 1
+  fi
+  if [[ "$NEW_FP" == "$FINGERPRINT" ]]; then
+    echo "That's already the current fingerprint ('${FINGERPRINT}'). No changes made."
+    exit 0
+  fi
+
+  FINGERPRINT="$NEW_FP"
+  save_state
+  output_client_info
+  echo ""
+  ok "Fingerprint changed to '${FINGERPRINT}'. No restart needed -- re-import the link above to use it."
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# MODE: --change-port [port]  (Xray listen port only; keeps UUID, short ID,
+# and REALITY keypair unchanged)
+#
+# The riskiest of the --change-* commands since it also has to touch UFW,
+# not just config.json. Ordered deliberately to fail safe: the new port's
+# UFW rule is added FIRST (before config.json is touched at all, before any
+# restart), and the OLD port's rule is only removed at the very end, after
+# Xray has been confirmed restarted and healthy on the new one. If anything
+# in between fails, you're left with both ports allowed through the
+# firewall rather than neither -- annoying to clean up manually, never a
+# lockout.
+# ---------------------------------------------------------------------------
+if [[ "$MODE" == "change-port" ]]; then
+  if [[ -z "$UUID" ]]; then
+    err "No existing install found (${STATE_FILE}). Run a full install first."
+    exit 1
+  fi
+
+  NEW_PORT="$NEW_PORT_ARG"
+  if [[ -z "$NEW_PORT" ]]; then
+    if [[ ! -t 0 ]]; then
+      err "--change-port requires a port number when there's no terminal to prompt on."
+      echo "       Usage: reality --change-port <port>" >&2
+      exit 1
+    fi
+    read -r -t 300 -p "New port to use [current: ${LISTEN_PORT}]: " NEW_PORT || true
+    if [[ -z "$NEW_PORT" ]]; then
+      echo "No port entered. Cancelled -- no changes made."
+      exit 0
+    fi
+  fi
+
+  if ! [[ "$NEW_PORT" =~ ^[0-9]+$ ]] || [[ "$NEW_PORT" -lt 1 ]] || [[ "$NEW_PORT" -gt 65535 ]]; then
+    err "Port must be a number between 1 and 65535 (got: '${NEW_PORT}')."
+    exit 1
+  fi
+
+  if [[ "$NEW_PORT" == "$LISTEN_PORT" ]]; then
+    echo "That's already the current port ('${LISTEN_PORT}'). No changes made."
+    exit 0
+  fi
+
+  # Conflict check: unlike the install-flow version of this check, no
+  # exclusion for "xray" is needed here -- xray is currently bound to the
+  # OLD port (already confirmed different above), so anything found
+  # listening on the NEW port is necessarily unrelated.
+  PORT_HOLDER=$(ss -tlnp 2>/dev/null | awk -v p=":${NEW_PORT}\$" '$4 ~ p {print}')
+  if [[ -n "$PORT_HOLDER" ]]; then
+    err "Port ${NEW_PORT} is already in use by something:"
+    echo "$PORT_HOLDER" | sed 's/^/  /' >&2
+    exit 1
+  fi
+
+  step "change-port" "Changing Xray listen port: ${LISTEN_PORT} -> ${NEW_PORT}"
+  backup_current_state
+  OLD_PORT="$LISTEN_PORT"
+
+  if command -v ufw >/dev/null 2>&1; then
+    if ! ufw allow "${NEW_PORT}"/tcp comment 'Xray REALITY'; then
+      err "Failed to add a UFW rule for port ${NEW_PORT}. Aborting before changing anything else."
+      exit 1
+    fi
+  fi
+
+  LISTEN_PORT="$NEW_PORT"
+  write_config
+  finish_and_restart
+
+  # Only reached if finish_and_restart's restart_and_verify confirmed Xray
+  # actually came up healthy on the new port -- safe to close the old one.
+  if command -v ufw >/dev/null 2>&1; then
+    ufw delete allow "${OLD_PORT}"/tcp >/dev/null 2>&1 || true
+    ufw reload >/dev/null 2>&1 || true
+  fi
+
+  echo ""
+  echo "Old client link is now invalid (port changed)."
   echo "Any device using it must import the new link above."
   exit 0
 fi
@@ -2381,6 +2536,8 @@ echo "  reality --rotate-uuid       -> revoke current client link, keep server i
 echo "  reality --rotate-all        -> full credential reset (invalidates everything)"
 echo "  reality --rotate-all --force -> same, but skips confirmation (for non-interactive use)"
 echo "  reality --change-sni <domain> -> change only the SNI, keeps UUID/keys unchanged"
+echo "  reality --change-fingerprint <value> -> change client uTLS fingerprint, no restart needed"
+echo "  reality --change-port <port> -> change only the listen port, keeps UUID/keys unchanged"
 echo "  reality --show              -> reprint current client link + QR"
 echo "  reality --status            -> consolidated health/config summary"
 echo "  reality --health-check      -> run the watchdog check manually"
