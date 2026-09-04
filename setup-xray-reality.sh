@@ -13,6 +13,17 @@
 #                                           regenerating your server's identity)
 #   ./setup-xray-reality.sh --rotate-all   Replace UUID + short ID + REALITY
 #                                           keypair (invalidates ALL client links)
+#   ./setup-xray-reality.sh --change-sni [domain]
+#                                           Change only the REALITY camouflage
+#                                           target (SNI) -- keeps UUID, short
+#                                           ID, and keypair unchanged. Prompts
+#                                           interactively if domain is omitted;
+#                                           requires one non-interactively. The
+#                                           new domain gets the same live
+#                                           TLS1.3 check as install (add
+#                                           --force to skip it). Still
+#                                           invalidates existing client links
+#                                           (server name has to match).
 #   ./setup-xray-reality.sh --show         Reprint the current client link/QR
 #                                           without changing anything
 #   ./setup-xray-reality.sh --list-backups List available backups with timestamps
@@ -161,6 +172,10 @@ RESTORE_TS=""
 case "${1:-}" in
   --rotate-uuid)   MODE="rotate-uuid" ;;
   --rotate-all)    MODE="rotate-all" ;;
+  --change-sni)
+    MODE="change-sni"
+    NEW_SNI_ARG="${2:-}"
+    ;;
   --show)          MODE="show" ;;
   --list-backups)  MODE="list-backups" ;;
   --dedupe-backups) MODE="dedupe-backups" ;;
@@ -188,7 +203,7 @@ case "${1:-}" in
     fi
     ;;
   --help|-h)
-    sed -n '2,91p' "$0"
+    sed -n '2,102p' "$0"
     exit 0
     ;;
   "") ;;
@@ -299,7 +314,7 @@ fi
 # you something is wrong) could itself be blocked by, say, qrencode going
 # missing for an unrelated reason. Check only what each mode actually uses.
 case "$MODE" in
-  rotate-uuid|rotate-all)
+  rotate-uuid|rotate-all|change-sni)
     REQUIRED_DEPS="jq openssl qrencode"
     ;;
   show)
@@ -356,8 +371,8 @@ if [[ -f "$STATE_FILE" ]]; then
   # what makes plain re-runs preserve credentials instead of regenerating
   # them. But that means SNI_DOMAIN=/LISTEN_PORT=... env vars silently do
   # nothing on an existing install, which is confusing without a message.
-  # There's currently no supported way to change just the SNI or port
-  # without a full --rotate-all (which also regenerates the keypair).
+  # Changing just the SNI has its own command (--change-sni); there's still
+  # no equivalent for the port without a full --rotate-all.
   # shellcheck disable=SC1090
   source "$STATE_FILE"
 
@@ -369,7 +384,7 @@ if [[ -f "$STATE_FILE" ]]; then
   if [[ -n "$SNI_DOMAIN_ENV_OVERRIDE" && "$SNI_DOMAIN_ENV_OVERRIDE" != "$SNI_DOMAIN" ]]; then
     warn "SNI_DOMAIN env var ('${SNI_DOMAIN_ENV_OVERRIDE}') was set, but an existing install already"
     echo "         uses '${SNI_DOMAIN}' -- existing state always wins, so the env var was ignored." >&2
-    echo "         There's no way to change just the SNI without --rotate-all (full reset)." >&2
+    echo "         To actually change it: reality --change-sni ${SNI_DOMAIN_ENV_OVERRIDE}" >&2
   fi
   if [[ "$LISTEN_PORT_DEFAULT" != "443" && "$LISTEN_PORT_DEFAULT" != "$LISTEN_PORT" ]]; then
     warn "LISTEN_PORT env var ('${LISTEN_PORT_DEFAULT}') was set, but an existing install already"
@@ -1442,6 +1457,99 @@ if [[ "$MODE" == "rotate-uuid" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+# MODE: --change-sni [domain]  (new REALITY camouflage target only; keeps
+# UUID, short ID, and REALITY keypair unchanged)
+#
+# Previously the only way to change the SNI was --rotate-all, which also
+# regenerates the REALITY keypair -- unnecessary blast radius if all you
+# actually want is a different camouflage target (e.g. the current one
+# stopped serving TLS1.3, or you just want a less-common choice than the
+# pool default). This changes only realitySettings.target/serverNames.
+#
+# Still invalidates existing client links, same as --rotate-uuid: the
+# server's REALITY serverName has to match what's in a client's saved
+# config, so anything importing the old link needs the new one after this.
+# ---------------------------------------------------------------------------
+if [[ "$MODE" == "change-sni" ]]; then
+  if [[ -z "$UUID" || -z "$PRIVATE_KEY" ]]; then
+    err "No existing install found (${STATE_FILE}). Run a full install first."
+    exit 1
+  fi
+
+  NEW_SNI="$NEW_SNI_ARG"
+  if [[ -n "$NEW_SNI" ]]; then
+    # Same sanitization as the install-time prompt: strip scheme, path,
+    # port, in case someone pastes a full URL by mistake.
+    NEW_SNI="${NEW_SNI#http://}"
+    NEW_SNI="${NEW_SNI#https://}"
+    NEW_SNI="${NEW_SNI%%/*}"
+    NEW_SNI="${NEW_SNI%%:*}"
+  fi
+
+  if [[ -z "$NEW_SNI" ]]; then
+    if [[ ! -t 0 ]]; then
+      err "--change-sni requires a domain when there's no terminal to prompt on."
+      echo "       Usage: reality --change-sni <domain>   (add --force to skip the live TLS1.3 check)" >&2
+      exit 1
+    fi
+    while true; do
+      echo ""
+      echo "Change REALITY camouflage target (SNI)"
+      echo "Current: ${SNI_DOMAIN}"
+      read -r -t 300 -p "New domain to use: " NEW_SNI || true
+      if [[ -z "$NEW_SNI" ]]; then
+        echo "No domain entered. Cancelled -- no changes made."
+        exit 0
+      fi
+      NEW_SNI="${NEW_SNI#http://}"
+      NEW_SNI="${NEW_SNI#https://}"
+      NEW_SNI="${NEW_SNI%%/*}"
+      NEW_SNI="${NEW_SNI%%:*}"
+      if [[ "$NEW_SNI" == "$SNI_DOMAIN" ]]; then
+        echo "That's already the current SNI. No changes made."
+        exit 0
+      fi
+      if command -v openssl >/dev/null 2>&1; then
+        if timeout 6 openssl s_client -connect "${NEW_SNI}:443" -servername "${NEW_SNI}" -tls1_3 </dev/null >/dev/null 2>&1; then
+          ok "Confirmed: ${NEW_SNI} resolves and serves TLS1.3 on port 443."
+          break
+        else
+          warn "Couldn't confirm ${NEW_SNI} serves TLS1.3 on port 443."
+          read -r -t 300 -p "Use it anyway? (y/N): " SNI_FORCE || true
+          [[ "$SNI_FORCE" =~ ^[Yy]$ ]] && break
+          # loop back and re-prompt
+        fi
+      else
+        break
+      fi
+    done
+  else
+    if [[ "$NEW_SNI" == "$SNI_DOMAIN" ]]; then
+      echo "That's already the current SNI ('${SNI_DOMAIN}'). No changes made."
+      exit 0
+    fi
+    if command -v openssl >/dev/null 2>&1 && ! timeout 6 openssl s_client -connect "${NEW_SNI}:443" -servername "${NEW_SNI}" -tls1_3 </dev/null >/dev/null 2>&1; then
+      if [[ "$FORCE_CONFIRM" -ne 1 ]]; then
+        err "Could not verify '${NEW_SNI}' serves TLS1.3 on port 443."
+        echo "       Re-run with --force to use it anyway: reality --change-sni ${NEW_SNI} --force" >&2
+        exit 1
+      fi
+      warn "Could not verify TLS1.3 for '${NEW_SNI}', proceeding anyway (--force)."
+    fi
+  fi
+
+  step "change-sni" "Changing REALITY SNI: ${SNI_DOMAIN} -> ${NEW_SNI}"
+  backup_current_state
+  SNI_DOMAIN="$NEW_SNI"
+  write_config
+  finish_and_restart
+  echo ""
+  echo "Old client link is now invalid (REALITY serverName mismatch)."
+  echo "Any device using it must import the new link above."
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
 # MODE: --rotate-all  (new UUID + short ID + REALITY keypair)
 # ---------------------------------------------------------------------------
 if [[ "$MODE" == "rotate-all" ]]; then
@@ -2272,6 +2380,7 @@ echo "  reality                     -> re-apply full setup (backs up old config 
 echo "  reality --rotate-uuid       -> revoke current client link, keep server identity"
 echo "  reality --rotate-all        -> full credential reset (invalidates everything)"
 echo "  reality --rotate-all --force -> same, but skips confirmation (for non-interactive use)"
+echo "  reality --change-sni <domain> -> change only the SNI, keeps UUID/keys unchanged"
 echo "  reality --show              -> reprint current client link + QR"
 echo "  reality --status            -> consolidated health/config summary"
 echo "  reality --health-check      -> run the watchdog check manually"
