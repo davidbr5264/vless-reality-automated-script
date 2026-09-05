@@ -1463,6 +1463,21 @@ if [[ "$MODE" == "restore" ]]; then
   [[ -f "${RESTORE_DIR}/state" ]] && cp -a "${RESTORE_DIR}/state" "$STATE_FILE" && chmod 600 "$STATE_FILE"
   [[ -f "${RESTORE_DIR}/client-info.txt" ]] && cp -a "${RESTORE_DIR}/client-info.txt" "$CLIENT_INFO_FILE" && chmod 600 "$CLIENT_INFO_FILE"
 
+  # Safety net for --change-port: if the port was ever changed since this
+  # backup was taken, --change-port would have correctly closed the OLD
+  # port in UFW when it opened the new one. Restoring this backup brings
+  # back a config targeting that now-closed port -- without this, Xray
+  # would come back up and even pass the loopback-only handshake check
+  # below, while being silently unreachable from the actual internet
+  # because nothing in this restore path otherwise touches the firewall.
+  # `ufw allow` is idempotent (a no-op if the rule already exists), so this
+  # is always safe to run regardless of whether the port actually changed.
+  RESTORED_PORT=$(jq -r '.inbounds[0].port // empty' "$CONFIG_FILE" 2>/dev/null)
+  if [[ -n "$RESTORED_PORT" ]] && command -v ufw >/dev/null 2>&1; then
+    ufw allow "${RESTORED_PORT}"/tcp comment 'Xray REALITY' >/dev/null 2>&1 || true
+    ufw reload >/dev/null 2>&1 || true
+  fi
+
   restart_and_verify
   echo ""
   echo "Restored from ${RESTORE_TS}. Run --show to reprint the restored client link."
@@ -2124,11 +2139,33 @@ SSH_PORT="${SSH_PORT:-22}"
 # forever. Detect and flag it -- but don't auto-delete: this script can't
 # tell a genuinely stale rule apart from an intentional second SSH listener,
 # and getting that wrong risks locking you out.
-STALE_SSH_RULES=$(ufw status numbered 2>/dev/null | grep "SSH" | grep -v "${SSH_PORT}/tcp" || true)
+#
+# The grep for the CURRENT port's line uses a digit-boundary pattern
+# ((^|[^0-9])PORT/tcp), not a plain substring match -- a plain
+# `grep -v "${SSH_PORT}/tcp"` would also silently swallow a genuinely stale
+# rule for, say, port 2222 when SSH_PORT=22, since "2222/tcp" contains
+# "22/tcp" as a substring. The boundary check requires the port number not
+# be preceded by another digit, so "8443/tcp" no longer false-matches
+# against a check for "443/tcp".
+STALE_SSH_RULES=$(ufw status numbered 2>/dev/null | grep "SSH" | grep -vE "(^|[^0-9])${SSH_PORT}/tcp" || true)
 if [[ -n "$STALE_SSH_RULES" ]]; then
   echo "NOTE: Found UFW rule(s) tagged 'SSH' for a port other than the current one (${SSH_PORT}):"
   echo "$STALE_SSH_RULES"
   echo "      If SSH used to run on a different port, this is probably stale and safe to"
+  echo "      remove with: ufw delete <rule number>   (run 'ufw status numbered' to check)"
+fi
+
+# Same idea for the Xray port: --change-port already removes its own old
+# rule on success, and --restore now re-opens whatever port it restores to
+# (see that mode), but this catches anything those two miss (a --change-
+# port cleanup that silently failed, or a port changed by hand outside
+# this script entirely) rather than leaving it open and unnoticed forever.
+# Same digit-boundary reasoning as the SSH check above.
+STALE_XRAY_RULES=$(ufw status numbered 2>/dev/null | grep "Xray REALITY" | grep -vE "(^|[^0-9])${LISTEN_PORT}/tcp" || true)
+if [[ -n "$STALE_XRAY_RULES" ]]; then
+  echo "NOTE: Found UFW rule(s) tagged 'Xray REALITY' for a port other than the current one (${LISTEN_PORT}):"
+  echo "$STALE_XRAY_RULES"
+  echo "      If the port used to be different, this is probably stale and safe to"
   echo "      remove with: ufw delete <rule number>   (run 'ufw status numbered' to check)"
 fi
 
