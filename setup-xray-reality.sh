@@ -50,9 +50,11 @@
 #                                           (keeps the most recent of each run)
 #   ./setup-xray-reality.sh --restore TS   Restore config/state from a backup
 #                                           (backs up current state first)
-#   ./setup-xray-reality.sh --status       Consolidated health check: BBR, qdisc,
-#                                           UFW, fail2ban jail, reboot timer,
-#                                           backup count, last update check
+#   ./setup-xray-reality.sh --status       Consolidated health check: current
+#                                           SNI/port, BBR, qdisc, UFW, fail2ban
+#                                           jail, reboot timer, backup count,
+#                                           last update check, stale UFW
+#                                           rules for an old Xray port
 #   ./setup-xray-reality.sh --health-check Verify the service is actually
 #                                           serving (not just "active"); auto-
 #                                           restart once if not, then alert.
@@ -229,7 +231,7 @@ case "${1:-}" in
     fi
     ;;
   --help|-h)
-    sed -n '2,120p' "$0"
+    sed -n '2,122p' "$0"
     exit 0
     ;;
   "") ;;
@@ -1126,6 +1128,23 @@ if [[ "$MODE" == "status" ]]; then
   echo "Backups available   : ${BACKUP_COUNT}"
   if [[ -n "$LAST_CHECK_STR" ]]; then
     echo "Xray-core last checked for updates: ${LAST_CHECK_STR}"
+  fi
+
+  # Surface a stale Xray-port UFW rule here too, not just during a full
+  # install re-run -- once someone's using --change-port going forward
+  # instead of re-running the full install, that was the only place this
+  # ever got checked, which could mean it's rarely (or never) seen again.
+  # Same digit-boundary reasoning as the install-time version of this
+  # check: a plain substring grep would miss e.g. a stale 8443 rule when
+  # the current port is 443.
+  if command -v ufw >/dev/null 2>&1; then
+    STALE_XRAY_RULES=$(ufw status numbered 2>/dev/null | grep "Xray REALITY" | grep -vE "(^|[^0-9])${LISTEN_PORT}/tcp" || true)
+    if [[ -n "$STALE_XRAY_RULES" ]]; then
+      echo ""
+      echo "NOTE: stale UFW rule(s) for a different Xray port than the current one (${LISTEN_PORT}):"
+      echo "$STALE_XRAY_RULES" | sed 's/^/  /'
+      echo "  Remove with: ufw delete <rule number>"
+    fi
   fi
 
   if [[ -f "$AUDIT_LOG" ]]; then
@@ -2527,7 +2546,7 @@ fi
 mkdir -p /etc/update-motd.d
 cat > /etc/update-motd.d/99-xray-reality <<EOF
 #!/bin/sh
-${REALITY_SHORTCUT} --status 2>/dev/null | head -n 20
+${REALITY_SHORTCUT} --status 2>/dev/null | head -n 25
 EOF
 chmod +x /etc/update-motd.d/99-xray-reality
 
