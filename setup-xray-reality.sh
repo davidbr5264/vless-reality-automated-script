@@ -6,7 +6,34 @@
 # instance on a Debian/Ubuntu VPS, for personal use.
 #
 # Usage:
-#   ./setup-xray-reality.sh                Install (or re-apply) full setup
+#   ./setup-xray-reality.sh                Install (or re-apply) full setup.
+#                                           Once installed, the same script is
+#                                           available as the `reality` command:
+#                                           run bare from a terminal it opens an
+#                                           interactive management menu (like
+#                                           3x-ui's `x-ui`); `reality install`
+#                                           re-applies the setup explicitly. In
+#                                           any non-interactive context (cloud-
+#                                           init, cron, `curl | bash`) a bare run
+#                                           still just installs.
+#   Subcommands also work without the dashes: `reality status`, `reality
+#   restart`, `reality log`, `reality enable` / `disable` (autostart), ...
+#   ./setup-xray-reality.sh --start | --stop | --restart
+#                                           Service control. --stop leaves a
+#                                           marker so the watchdog won't undo it
+#                                           (it also stands down if autostart has
+#                                           been disabled).
+#   ./setup-xray-reality.sh --enable-autostart | --disable-autostart
+#                                           Start xray on boot, or not.
+#   ./setup-xray-reality.sh --logs [-f]    Recent service/error logs (-f follows)
+#   ./setup-xray-reality.sh --update       Update THIS script from SCRIPT_SOURCE_URL
+#                                           (validated first), then re-apply the
+#                                           setup with it. Credentials are kept.
+#   ./setup-xray-reality.sh --uninstall    Remove the proxy and everything installed
+#                                           for it (needs --force when there is no
+#                                           terminal). Host hardening -- UFW, SSH
+#                                           rule, fail2ban, BBR/sysctl -- stays.
+#   ./setup-xray-reality.sh --menu         Open the management menu explicitly
 #   ./setup-xray-reality.sh --rotate-uuid  Replace UUID + short ID only
 #                                           (keeps REALITY keypair; use this to
 #                                           revoke a leaked client link without
@@ -123,16 +150,92 @@
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
-# Terminal output helpers (plain text, no color/animation)
+# Terminal output helpers.
+#
+# Color is applied ONLY when the relevant stream is a real terminal, so
+# cloud-init logs, cron mail, and anything piped through tee/less stay plain
+# text with no escape codes -- that matters for the headless `curl | bash`
+# deployment path, where this output ends up in /var/log/cloud-init-output.log.
 # ---------------------------------------------------------------------------
+if [[ -t 1 ]]; then
+  C_RED=$'\033[31m'; C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'
+  C_BLUE=$'\033[34m'; C_BOLD=$'\033[1m'; C_RESET=$'\033[0m'
+else
+  C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""; C_BOLD=""; C_RESET=""
+fi
+if [[ -t 2 ]]; then
+  E_RED=$'\033[31m'; E_YELLOW=$'\033[33m'; E_RESET=$'\033[0m'
+else
+  E_RED=""; E_YELLOW=""; E_RESET=""
+fi
+
 step() {
   echo ""
-  echo "=== [$1] $2 ==="
+  echo "${C_BOLD}=== [$1] $2 ===${C_RESET}"
 }
 
-ok()   { echo "  OK: $1"; }
-warn() { echo "  WARNING: $1" >&2; }
-err()  { echo "  ERROR: $1" >&2; }
+ok()   { echo "  ${C_GREEN}OK:${C_RESET} $1"; }
+warn() { echo "  ${E_YELLOW}WARNING:${E_RESET} $1" >&2; }
+err()  { echo "  ${E_RED}ERROR:${E_RESET} $1" >&2; }
+
+# ---------------------------------------------------------------------------
+# Box drawing for the menu and usage list. box_line pads based on the VISIBLE
+# width (ANSI color codes stripped), so colored text still lines up with the
+# right-hand border. Keep the text itself ASCII -- width is counted in
+# characters, and a C-locale shell would count multi-byte characters as bytes.
+# ---------------------------------------------------------------------------
+BOX_W=70
+BOX_RULE=""
+for ((_i = 0; _i < BOX_W; _i++)); do BOX_RULE+="─"; done
+box_top() { printf '┌%s┐\n' "$BOX_RULE"; }
+box_sep() { printf '├%s┤\n' "$BOX_RULE"; }
+box_bot() { printf '└%s┘\n' "$BOX_RULE"; }
+box_line() {
+  local text="${1:-}" plain pad
+  plain=$(printf '%s' "$text" | sed $'s/\033\\[[0-9;]*m//g')
+  pad=$((BOX_W - 2 - ${#plain}))
+  if [[ "$pad" -lt 0 ]]; then pad=0; fi
+  printf '│  %s%*s│\n' "$text" "$pad" ""
+}
+# One "command - description" row, command column colored.
+box_cmd() { box_line "$(printf '%s%-30s%s %s' "$C_BLUE" "$1" "$C_RESET" "$2")"; }
+
+# Compact command reference, shown by `reality --help`, after an unknown
+# subcommand, and at the end of an install. (The long comment block at the top
+# of this file documents behavior in detail; this is the quick reference.)
+usage() {
+  box_top
+  box_line "${C_BOLD}reality${C_RESET} control menu usages (subcommands):"
+  box_line ""
+  box_cmd "reality"                      "- Management menu (interactive)"
+  box_cmd "reality install"              "- Install / re-apply full setup"
+  box_cmd "reality update"               "- Update this script, then re-apply"
+  box_cmd "reality update-core"          "- Update Xray-core now"
+  box_cmd "reality uninstall"            "- Uninstall"
+  box_sep
+  box_cmd "reality start"                "- Start"
+  box_cmd "reality stop"                 "- Stop (watchdog won't restart it)"
+  box_cmd "reality restart"              "- Restart"
+  box_cmd "reality status"               "- Current status"
+  box_cmd "reality log [-f]"             "- Check logs (-f to follow)"
+  box_cmd "reality enable"               "- Enable autostart on boot"
+  box_cmd "reality disable"              "- Disable autostart on boot"
+  box_sep
+  box_cmd "reality show"                 "- Client link + QR code"
+  box_cmd "reality rotate-uuid"          "- New UUID (revokes the old link)"
+  box_cmd "reality rotate-all"           "- New UUID + keys (revokes ALL)"
+  box_cmd "reality change-sni [domain]"  "- Change the camouflage domain"
+  box_cmd "reality change-port [port]"   "- Change the listen port"
+  box_cmd "reality change-fingerprint V" "- Change client uTLS fingerprint"
+  box_sep
+  box_cmd "reality health-check"         "- Run the watchdog check now"
+  box_cmd "reality set-webhook <url>"    "- Alert webhook ('' to clear)"
+  box_cmd "reality list-backups"         "- List config backups"
+  box_cmd "reality restore <timestamp>"  "- Restore a backup"
+  box_cmd "reality dedupe-backups"       "- Remove duplicate backups"
+  box_bot
+  echo "Flags: --force / --yes skip confirmation prompts (needed when there is no terminal)."
+}
 
 # ---------------------------------------------------------------------------
 # Configuration (edit if needed, or override via environment variables)
@@ -173,6 +276,9 @@ FINGERPRINT_DEFAULT="${FINGERPRINT:-random}"
 # where $0 doesn't point to an actual file on disk. Override via env var
 # if you're running a fork of this script from a different location.
 SCRIPT_SOURCE_URL="${SCRIPT_SOURCE_URL:-https://raw.githubusercontent.com/davidbr5264/vless-reality-automated-script/master/setup-xray-reality.sh}"
+# Where the installed management command lives (used by the install step that
+# copies this script there, and by the menu/update/uninstall modes).
+REALITY_SHORTCUT="/usr/local/bin/reality"
 XRAY_CONFIG_DIR="/usr/local/etc/xray"
 CONFIG_FILE="${XRAY_CONFIG_DIR}/config.json"
 STATE_FILE="${XRAY_CONFIG_DIR}/.reality-state"    # remembers settings between runs
@@ -189,7 +295,36 @@ ALERT_WEBHOOK="${REALITY_ALERT_WEBHOOK:-}"
 
 MODE="install"
 RESTORE_TS=""
+
+# Accept bare subcommands (`reality status`, `reality restart`, ...) as
+# aliases for their --flag forms, the way most management CLIs (and 3x-ui's
+# `x-ui start`) work. A few get friendlier names than their flag.
+if [[ -n "${1:-}" && "${1:-}" != -* ]]; then
+  case "$1" in
+    enable)               _first="--enable-autostart" ;;
+    disable)              _first="--disable-autostart" ;;
+    log|logs)             _first="--logs" ;;
+    update-core|update-xray) _first="--update-core-only" ;;
+    *)                    _first="--$1" ;;
+  esac
+  shift
+  set -- "$_first" "$@"
+fi
+
 case "${1:-}" in
+  --install)       MODE="install" ;;
+  --menu)          MODE="menu" ;;
+  --start)         MODE="start" ;;
+  --stop)          MODE="stop" ;;
+  --restart)       MODE="restart" ;;
+  --enable-autostart)  MODE="enable-autostart" ;;
+  --disable-autostart) MODE="disable-autostart" ;;
+  --logs)
+    MODE="logs"
+    LOGS_ARG="${2:-}"
+    ;;
+  --update)        MODE="update" ;;
+  --uninstall)     MODE="uninstall" ;;
   --rotate-uuid)   MODE="rotate-uuid" ;;
   --rotate-all)    MODE="rotate-all" ;;
   --change-sni)
@@ -231,15 +366,35 @@ case "${1:-}" in
     fi
     ;;
   --help|-h)
-    sed -n '2,122p' "$0"
+    usage
     exit 0
     ;;
   "") ;;
   *)
-    err "Unknown argument '$1'. Use --help for usage."
+    err "Unknown argument '$1'."
+    usage >&2
     exit 1
     ;;
 esac
+
+# 3x-ui-style behavior: running the INSTALLED `reality` command with no
+# arguments, from a real terminal, on a machine that already has an install,
+# opens the management menu instead of silently re-running the whole install.
+# Deliberately narrow so nothing else changes:
+#   - needs a terminal on both stdin and stdout (cloud-init, cron, `curl | bash`
+#     and anything piped keep the original install behavior)
+#   - needs existing state (a fresh machine still just installs)
+#   - needs to be the installed shortcut itself, so the one-liner
+#     `bash <(curl ...)` and a downloaded copy still install/update as before
+#     (like 3x-ui: the one-liner installs/updates, the command is the menu)
+# `reality install` (or --install) re-applies the full setup explicitly.
+if [[ "$MODE" == "install" && $# -eq 0 && -t 0 && -t 1 && -f "$STATE_FILE" ]]; then
+  _self_resolved="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+  _shortcut_resolved="$(readlink -f /usr/local/bin/reality 2>/dev/null || echo /usr/local/bin/reality)"
+  if [[ "$_self_resolved" == "$_shortcut_resolved" ]]; then
+    MODE="menu"
+  fi
+fi
 
 # Optional second flag, currently only meaningful for --rotate-all (see
 # below): explicit opt-in to skip the interactive confirmation prompt when
@@ -266,6 +421,12 @@ log_run_outcome() {
   local exit_code=$?
   local outcome="success"
   [[ "$exit_code" -ne 0 ]] && outcome="failed(exit ${exit_code})"
+  # The menu is only a launcher -- every action it runs is its own audited
+  # run -- and uninstall deletes the log itself (logging after that would just
+  # recreate a stray file).
+  case "${MODE:-}" in
+    menu|uninstall) return 0 ;;
+  esac
   echo "$(date -Is) mode=${MODE} outcome=${outcome}" >> "$AUDIT_LOG" 2>/dev/null || true
 
   # For install mode specifically -- the one-shot "did my unattended
@@ -314,6 +475,12 @@ LOCK_FILE="/var/lock/reality-setup.lock"
 exec 200>"$LOCK_FILE"
 LOCK_ACQUIRED=1
 case "$MODE" in
+  menu|logs)
+    # The menu only launches other runs of this script, each of which takes
+    # the lock itself -- holding it here would make every action from the menu
+    # fail with "another run is in progress". `logs` is read-only, and
+    # `log -f` would otherwise hold the lock for as long as you keep following.
+    ;;
   health-check|update-core-only|dedupe-backups)
     flock -w 30 200 || LOCK_ACQUIRED=0
     ;;
@@ -502,6 +669,31 @@ generate_reality_keypair() {
 }
 
 # ---------------------------------------------------------------------------
+# Helper: make /var/log/xray usable by the xray service account.
+#
+# The service runs as the unprivileged 'xray' user (via our systemd drop-in),
+# but the OFFICIAL installer doesn't know that: it reads User= from its own
+# base unit (nobody). Whenever it performs a real install/update and
+# /var/log/xray already exists, it resets the directory to root:root 755 and
+# chowns the *.log files to that base-unit user with mode 600 (verified
+# against XTLS/Xray-install's install_xray()). Xray opens its log files while
+# the logger is constructed and refuses to start if it can't, so after any
+# genuine Xray-core update the service would fail to come back up until
+# someone manually re-ran the full install (which re-chowns via write_config).
+#
+# Idempotent and cheap, so it's called both from write_config and right
+# after every run of the official installer (see --update-core-only). Guarded
+# on the account existing because step 2 of a fresh install runs the
+# installer before step 3 creates the xray user.
+# ---------------------------------------------------------------------------
+ensure_xray_log_permissions() {
+  mkdir -p /var/log/xray
+  if id -u xray >/dev/null 2>&1; then
+    chown -R xray:xray /var/log/xray 2>/dev/null || true
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # Helper: write config.json from current UUID/keys/short ID
 # ---------------------------------------------------------------------------
 write_config() {
@@ -613,8 +805,7 @@ EOF
   # the config if that path's parent directory doesn't exist yet (confirmed
   # by testing against a real xray-core binary: this order bug would have
   # broken every fresh install otherwise).
-  mkdir -p /var/log/xray
-  chown -R xray:xray /var/log/xray 2>/dev/null || true
+  ensure_xray_log_permissions
 
   if command -v xray >/dev/null 2>&1; then
     if ! XRAY_TEST_OUTPUT=$(xray run -test -format json -config "$tmp_config" 2>&1); then
@@ -989,6 +1180,419 @@ if [[ "$MODE" == "set-webhook" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+# Lifecycle modes: start / stop / restart / enable / disable / logs
+#
+# These cover the day-to-day basics of a management command (what 3x-ui's
+# `x-ui start|stop|restart|enable|disable|log` do) rather than only the
+# one-off operations. The twist specific to this project is the unattended
+# automation: without care, the watchdog would quietly undo a deliberate
+# `stop` within ten minutes, so `stop` leaves a marker that --health-check
+# honors (see the self-heal logic there; it also stands down when autostart
+# has been disabled on purpose).
+# ---------------------------------------------------------------------------
+USER_STOPPED_MARKER="${XRAY_CONFIG_DIR}/.user-stopped"
+
+# Start or restart the service WITHOUT re-enabling it. (restart_and_verify
+# also runs `systemctl enable`, which is right for install/rotate flows but
+# would silently undo a deliberate `reality disable` on every restart.)
+start_or_restart_service() {
+  systemctl "$1" "${SERVICE_NAME}" || true
+  sleep 1
+  if ! systemctl is-active --quiet "${SERVICE_NAME}"; then
+    err "xray service failed to start. Check: journalctl -u xray -e"
+    return 1
+  fi
+  ok "xray service is active"
+  verify_handshake
+}
+
+if [[ "$MODE" == "start" ]]; then
+  rm -f "$USER_STOPPED_MARKER"
+  ensure_xray_log_permissions
+  start_or_restart_service start || exit 1
+  exit 0
+fi
+
+if [[ "$MODE" == "restart" ]]; then
+  rm -f "$USER_STOPPED_MARKER"
+  ensure_xray_log_permissions
+  start_or_restart_service restart || exit 1
+  exit 0
+fi
+
+if [[ "$MODE" == "stop" ]]; then
+  touch "$USER_STOPPED_MARKER"
+  systemctl stop "${SERVICE_NAME}" || true
+  if systemctl is-active --quiet "${SERVICE_NAME}"; then
+    err "xray is still running after 'systemctl stop'. Check: systemctl status xray"
+    exit 1
+  fi
+  ok "xray stopped. The watchdog will leave it alone until you run: reality start"
+  echo "     (With autostart enabled it still comes back after the next reboot, the daily one included.)"
+  exit 0
+fi
+
+if [[ "$MODE" == "enable-autostart" ]]; then
+  if ! systemctl enable "${SERVICE_NAME}" >/dev/null 2>&1; then
+    err "Could not enable the xray service. Check: systemctl status xray"
+    exit 1
+  fi
+  ok "xray will start automatically on boot."
+  exit 0
+fi
+
+if [[ "$MODE" == "disable-autostart" ]]; then
+  if ! systemctl disable "${SERVICE_NAME}" >/dev/null 2>&1; then
+    err "Could not disable the xray service. Check: systemctl status xray"
+    exit 1
+  fi
+  ok "xray will NOT start on boot any more (it keeps running until stopped or rebooted)."
+  echo "     This server reboots daily, so xray stays down after the next reboot until you run:"
+  echo "       reality enable && reality start"
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# MODE: --logs [-f]  (read-only)
+# ---------------------------------------------------------------------------
+if [[ "$MODE" == "logs" ]]; then
+  if [[ "${LOGS_ARG:-}" == "-f" || "${LOGS_ARG:-}" == "--follow" ]]; then
+    echo "Following the xray service log (Ctrl-C to stop)..."
+    exec journalctl -u "${SERVICE_NAME}" -f --no-hostname
+  fi
+  step "logs" "xray service log (journal, last 50 lines)"
+  journalctl -u "${SERVICE_NAME}" -n 50 --no-pager 2>/dev/null || echo "  (journalctl is not available here)"
+  if [[ -s /var/log/xray/error.log ]]; then
+    step "logs" "xray error log (/var/log/xray/error.log, last 30 lines)"
+    tail -n 30 /var/log/xray/error.log
+  fi
+  if [[ -f "$AUDIT_LOG" ]]; then
+    step "logs" "reality run history (last 15 runs)"
+    tail -n 15 "$AUDIT_LOG"
+  fi
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# MODE: --update  (update THIS script, then re-apply the setup with it)
+#
+# Updating only the script file wouldn't apply anything new it brings (units,
+# timers, hardening are written during install), so after swapping it in this
+# re-applies the setup with the new version. Credentials are preserved -- the
+# install is idempotent and reuses saved state.
+# ---------------------------------------------------------------------------
+if [[ "$MODE" == "update" ]]; then
+  step "update" "Updating this script from ${SCRIPT_SOURCE_URL}"
+  UPDATE_TMP=$(mktemp)
+  if ! curl -fsSL --connect-timeout 10 --max-time 60 "$SCRIPT_SOURCE_URL" -o "$UPDATE_TMP"; then
+    rm -f "$UPDATE_TMP"
+    err "Could not download ${SCRIPT_SOURCE_URL} (network issue, or a wrong SCRIPT_SOURCE_URL?)."
+    exit 1
+  fi
+  # Only install something that is plausibly this script: valid bash, a bash
+  # shebang, and our own name inside -- not an HTML error page or another file.
+  if ! bash -n "$UPDATE_TMP" 2>/dev/null \
+     || ! head -n1 "$UPDATE_TMP" | grep -q '^#!.*bash' \
+     || ! grep -q 'setup-xray-reality' "$UPDATE_TMP"; then
+    rm -f "$UPDATE_TMP"
+    err "The downloaded file doesn't look like a valid copy of this script -- not installing it."
+    exit 1
+  fi
+  if cmp -s "$UPDATE_TMP" "$REALITY_SHORTCUT" 2>/dev/null; then
+    rm -f "$UPDATE_TMP"
+    ok "Already running the latest version of this script."
+    echo "     (To re-apply the setup anyway: reality install)"
+    exit 0
+  fi
+  if [[ -t 0 && "$FORCE_CONFIRM" -ne 1 ]]; then
+    CONFIRM_UPDATE=""
+    read -r -t 300 -p "A newer version is available. Install it and re-apply the setup (credentials are kept)? [y/N]: " CONFIRM_UPDATE || true
+    if [[ ! "$CONFIRM_UPDATE" =~ ^[Yy]$ ]]; then
+      rm -f "$UPDATE_TMP"
+      echo "Cancelled. No changes made."
+      exit 0
+    fi
+  fi
+  # Swap in atomically (write next to the target, then rename). Overwriting in
+  # place would corrupt this very process when it is running from that file.
+  install -m 755 "$UPDATE_TMP" "${REALITY_SHORTCUT}.new"
+  mv -f "${REALITY_SHORTCUT}.new" "$REALITY_SHORTCUT"
+  rm -f "$UPDATE_TMP"
+  ok "Installed the new version to ${REALITY_SHORTCUT}."
+  echo "Re-applying the setup with the new version (credentials are preserved)..."
+  exec 200>&-   # release our lock so the new process can take it
+  exec "$REALITY_SHORTCUT" --install
+fi
+
+# ---------------------------------------------------------------------------
+# MODE: --uninstall
+#
+# Removes the proxy and everything this script installed FOR it. Deliberately
+# leaves the general host hardening in place (UFW and its SSH rule, fail2ban,
+# BBR/sysctl, the journald size cap, security-only unattended upgrades) --
+# those protect the box whether or not it still runs a proxy, and tearing out
+# the firewall as a side effect of removing an app would be a nasty surprise.
+# ---------------------------------------------------------------------------
+if [[ "$MODE" == "uninstall" ]]; then
+  if [[ -t 0 ]]; then
+    echo ""
+    warn "This REMOVES the Xray proxy and what this script installed for it:"
+    echo "    - the xray service, binary, config and credentials (the current client link stops working)"
+    echo "    - the watchdog, auto-update, backup-maintenance and daily-reboot timers"
+    echo "    - ${REALITY_SHORTCUT}, the login banner, logs, backups and ${CLIENT_INFO_FILE}"
+    echo "    - the UFW rule(s) for the Xray port (currently ${LISTEN_PORT})"
+    echo "  Left in place: UFW itself + SSH rule, fail2ban, BBR/sysctl tuning, journald cap."
+    CONFIRM_UNINSTALL=""
+    read -r -t 300 -p "Type 'yes' to uninstall: " CONFIRM_UNINSTALL || true
+    if [[ "$CONFIRM_UNINSTALL" != "yes" ]]; then
+      echo "Cancelled. No changes made."
+      exit 0
+    fi
+  elif [[ "$FORCE_CONFIRM" -ne 1 ]]; then
+    err "--uninstall removes the proxy and all credentials, and there is no terminal to confirm on."
+    echo "       Re-run with --uninstall --force if this is intentional." >&2
+    exit 1
+  fi
+
+  step "uninstall" "Removing Xray REALITY"
+
+  # Stop the automation first so nothing restarts xray (or reboots the box)
+  # while it's being taken apart.
+  for unit in reality-watchdog reality-autoupdate reality-backup-maintenance daily-reboot; do
+    systemctl disable --now "${unit}.timer" >/dev/null 2>&1 || true
+    rm -f "/etc/systemd/system/${unit}.timer" "/etc/systemd/system/${unit}.service"
+  done
+  ok "Removed the watchdog, auto-update, backup-maintenance and daily-reboot timers."
+
+  # Firewall: delete every rule tagged for Xray (this port and any stale ones).
+  # Highest rule number first so the remaining numbers stay valid as we go.
+  if command -v ufw >/dev/null 2>&1; then
+    XRAY_RULE_NUMS=$(ufw status numbered 2>/dev/null | grep 'Xray REALITY' | sed -E 's/^\[ *([0-9]+)\].*/\1/' | sort -rn || true)
+    for rule_num in $XRAY_RULE_NUMS; do
+      ufw --force delete "$rule_num" >/dev/null 2>&1 || true
+    done
+    # Also the plain form, in case the rule was added without our comment.
+    ufw delete allow "${LISTEN_PORT}"/tcp >/dev/null 2>&1 || true
+    ufw reload >/dev/null 2>&1 || true
+    ok "Removed the UFW rule(s) for the Xray port."
+  fi
+
+  systemctl disable --now "${SERVICE_NAME}" >/dev/null 2>&1 || true
+  rm -rf /etc/systemd/system/xray.service.d /etc/systemd/system/xray@.service.d
+  rm -f /etc/systemd/system/xray.service /etc/systemd/system/xray@.service /etc/systemd/system/xray-alert.service
+  rm -f /usr/local/bin/xray
+  rm -rf /usr/local/share/xray
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl reset-failed >/dev/null 2>&1 || true
+  ok "Removed the xray service and binary."
+
+  rm -f /etc/logrotate.d/xray /etc/logrotate.d/reality-setup /etc/update-motd.d/99-xray-reality
+  rm -rf "$XRAY_CONFIG_DIR" /var/log/xray "$BACKUP_ROOT"
+  rm -f "$CLIENT_INFO_FILE" "${CLIENT_INFO_FILE%.txt}-qr.png" "$AUDIT_LOG"
+  if id -u xray >/dev/null 2>&1; then
+    userdel xray >/dev/null 2>&1 || true
+  fi
+  ok "Removed config, credentials, backups, logs and the xray service account."
+
+  # Last: this may be the very file we're running from. That's fine on Linux --
+  # the open file stays readable until we exit.
+  rm -f "$REALITY_SHORTCUT" "$LOCK_FILE"
+
+  echo ""
+  ok "Uninstalled."
+  echo "     Host hardening was left in place. To undo any of it yourself:"
+  echo "       /etc/sysctl.d/99-xray-hardening.conf   /etc/modules-load.d/bbr.conf"
+  echo "       /etc/fail2ban/jail.d/sshd.local        /etc/systemd/journald.conf.d/99-xray-hardening.conf"
+  echo "       /etc/apt/apt.conf.d/51-xray-security-only    (and 'ufw disable' if you don't want the firewall)"
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# MODE: --menu  (interactive management menu)
+#
+# Opened by running the installed `reality` command with no arguments from a
+# terminal (see the auto-trigger near the top), or explicitly with --menu. Every
+# action just runs this script again with the matching subcommand, so the menu
+# can't drift from the CLI -- one implementation, two front-ends.
+# ---------------------------------------------------------------------------
+if [[ "$MODE" == "menu" ]]; then
+  if [[ ! -t 0 || ! -t 1 ]]; then
+    err "The menu needs an interactive terminal. Run 'reality --help' to see the subcommands."
+    exit 1
+  fi
+  if [[ -x "$REALITY_SHORTCUT" ]]; then
+    MENU_SELF="$REALITY_SHORTCUT"
+  elif [[ -f "$0" ]]; then
+    MENU_SELF="$(readlink -f "$0")"
+  else
+    err "Can't find the installed 'reality' command to run menu actions with. Run a full install first."
+    exit 1
+  fi
+
+  menu_pause() {
+    local _ignored=""
+    echo ""
+    read -r -p "${C_YELLOW}Press enter to return to the main menu: ${C_RESET}" _ignored || true
+  }
+  # A failing action must not kill the menu (the action already printed why).
+  menu_run() { "$MENU_SELF" "$@" || true; }
+  menu_confirm() {
+    local answer=""
+    read -r -p "$1 [y/N]: " answer || true
+    [[ "$answer" =~ ^[Yy]$ ]]
+  }
+  menu_row() { box_line "$(printf '%s%3s.%s %s' "$C_GREEN" "$1" "$C_RESET" "$2")"; }
+
+  # Re-read saved state every time the menu is drawn: actions like change-sni
+  # run as separate processes, so this process's copy would otherwise go stale.
+  menu_status() {
+    local state boot
+    if [[ -f "$STATE_FILE" ]]; then
+      # shellcheck disable=SC1090
+      source "$STATE_FILE"
+    fi
+    if systemctl is-active --quiet "${SERVICE_NAME}"; then
+      state="${C_GREEN}Running${C_RESET}"
+    else
+      state="${C_RED}Not running${C_RESET}"
+    fi
+    if systemctl is-enabled --quiet "${SERVICE_NAME}" 2>/dev/null; then
+      boot="${C_GREEN}Yes${C_RESET}"
+    else
+      boot="${C_RED}No${C_RESET}"
+    fi
+    echo "Xray state:      ${state}"
+    echo "Start on boot:   ${boot}"
+    echo "Xray-core:       $(xray version 2>/dev/null | head -n1 || echo unknown)"
+    echo "SNI / port:      ${SNI_DOMAIN} / ${LISTEN_PORT}   (fingerprint: ${FINGERPRINT})"
+    if [[ -f "$USER_STOPPED_MARKER" ]]; then
+      echo "${C_YELLOW}Stopped manually: the watchdog won't restart it. Choose 'Start' to bring it back.${C_RESET}"
+    fi
+  }
+
+  while true; do
+    echo ""
+    box_top
+    box_line "${C_GREEN}Xray REALITY Management Script${C_RESET}"
+    menu_row 0 "Exit"
+    box_sep
+    menu_row 1 "Install / re-apply full setup"
+    menu_row 2 "Update this script"
+    menu_row 3 "Update Xray-core"
+    menu_row 4 "Uninstall"
+    box_sep
+    menu_row 5 "Show client link + QR code"
+    menu_row 6 "Rotate UUID (revoke the current client link)"
+    menu_row 7 "Rotate ALL credentials (UUID + keys)"
+    menu_row 8 "Change SNI (camouflage domain)"
+    menu_row 9 "Change port"
+    menu_row 10 "Change client fingerprint"
+    box_sep
+    menu_row 11 "Start"
+    menu_row 12 "Stop"
+    menu_row 13 "Restart"
+    menu_row 14 "Check status"
+    menu_row 15 "View logs"
+    menu_row 16 "Enable autostart on boot"
+    menu_row 17 "Disable autostart on boot"
+    box_sep
+    menu_row 18 "Run health check now"
+    menu_row 19 "Alert webhook"
+    menu_row 20 "Backups (list / restore / dedupe)"
+    box_bot
+    echo ""
+    menu_status
+    echo ""
+
+    MENU_CHOICE=""
+    if ! read -r -p "Please enter your selection [0-20]: " MENU_CHOICE; then
+      echo ""
+      exit 0   # EOF (Ctrl-D)
+    fi
+
+    case "$MENU_CHOICE" in
+      0) exit 0 ;;
+      1)
+        if menu_confirm "Re-apply the full setup now (credentials are kept)?"; then
+          menu_run --install
+        fi
+        menu_pause ;;
+      2) menu_run --update; menu_pause ;;
+      3) menu_run --update-core-only; menu_pause ;;
+      4)
+        menu_run --uninstall
+        # If it went through, there is no command left to run -- leave the menu.
+        if [[ ! -x "$MENU_SELF" ]]; then exit 0; fi
+        menu_pause ;;
+      5) menu_run --show; menu_pause ;;
+      6)
+        if menu_confirm "Rotate the UUID? The current client link stops working."; then
+          menu_run --rotate-uuid
+        fi
+        menu_pause ;;
+      7) menu_run --rotate-all; menu_pause ;;   # asks for its own 'yes'
+      8) menu_run --change-sni; menu_pause ;;   # prompts for the domain itself
+      9) menu_run --change-port; menu_pause ;;  # prompts for the port itself
+      10)
+        MENU_FP=""
+        read -r -p "New fingerprint [chrome|firefox|safari|ios|android|edge|360|qq|random|randomized]: " MENU_FP || true
+        if [[ -n "$MENU_FP" ]]; then menu_run --change-fingerprint "$MENU_FP"; fi
+        menu_pause ;;
+      11) menu_run --start; menu_pause ;;
+      12) menu_run --stop; menu_pause ;;
+      13) menu_run --restart; menu_pause ;;
+      14) menu_run --status; menu_pause ;;
+      15) menu_run --logs; menu_pause ;;
+      16) menu_run --enable-autostart; menu_pause ;;
+      17) menu_run --disable-autostart; menu_pause ;;
+      18)
+        # The check prints nothing when everything is fine, which would look
+        # like it did nothing -- so say so explicitly.
+        if "$MENU_SELF" --health-check; then
+          ok "Health check finished: nothing needs attention (it prints nothing when healthy)."
+        else
+          warn "The health check reported a problem -- see above, or run: reality log"
+        fi
+        menu_pause ;;
+      19)
+        MENU_HOOK=""
+        read -r -p "Webhook URL for alerts (leave empty to clear it): " MENU_HOOK || true
+        if [[ -n "$MENU_HOOK" ]]; then
+          menu_run --set-webhook "$MENU_HOOK"
+        elif menu_confirm "Clear the alert webhook?"; then
+          menu_run --set-webhook ""
+        fi
+        menu_pause ;;
+      20)
+        echo ""
+        echo "  1. List backups"
+        echo "  2. Restore a backup"
+        echo "  3. Remove duplicate backups"
+        echo "  0. Back"
+        MENU_SUB=""
+        read -r -p "Selection [0-3]: " MENU_SUB || true
+        case "$MENU_SUB" in
+          1) menu_run --list-backups ;;
+          2)
+            menu_run --list-backups
+            MENU_TS=""
+            read -r -p "Timestamp to restore (as listed above, empty to cancel): " MENU_TS || true
+            if [[ -n "$MENU_TS" ]] && menu_confirm "Restore ${MENU_TS}? (the current state is backed up first)"; then
+              menu_run --restore "$MENU_TS"
+            fi
+            ;;
+          3) menu_run --dedupe-backups ;;
+          *) ;;
+        esac
+        menu_pause ;;
+      *)
+        warn "Please enter a number between 0 and 20."
+        sleep 1 ;;
+    esac
+  done
+fi
+
+# ---------------------------------------------------------------------------
 # MODE: --list-backups  (read-only, no changes)
 # ---------------------------------------------------------------------------
 if [[ "$MODE" == "list-backups" ]]; then
@@ -1177,12 +1781,24 @@ if [[ "$MODE" == "health-check" ]]; then
   HEALTH_ISSUE=""
   HEALTH_EXIT_CODE=0
 
-  if ! systemctl is-active --quiet "${SERVICE_NAME}"; then
+  # Respect deliberate choices made through `reality stop` / `reality disable`:
+  # a service that is down ON PURPOSE is not an outage, and "healing" it would
+  # undo the user's command within ten minutes. Stand down only when BOTH hold:
+  # the service is not running AND either it was stopped by hand (marker) or
+  # autostart was switched off. A running service is always checked normally,
+  # and the stop marker is cleared as soon as it's seen running again (started
+  # by hand, or brought back at boot) so it can't linger and mask a real outage.
+  if systemctl is-active --quiet "${SERVICE_NAME}"; then
+    rm -f "$USER_STOPPED_MARKER"
+    if ! ss -tln 2>/dev/null | grep -q ":${LISTEN_PORT} "; then
+      HEALTH_ISSUE="active but nothing listening on port ${LISTEN_PORT}"
+    elif ! timeout 5 bash -c "exec 3<>/dev/tcp/127.0.0.1/${LISTEN_PORT}" 2>/dev/null; then
+      HEALTH_ISSUE="port ${LISTEN_PORT} listed as listening but local TCP connect failed"
+    fi
+  elif [[ -f "$USER_STOPPED_MARKER" ]] || ! systemctl is-enabled --quiet "${SERVICE_NAME}" 2>/dev/null; then
+    : # deliberately down -- not an issue, nothing to heal
+  else
     HEALTH_ISSUE="service not active"
-  elif ! ss -tln 2>/dev/null | grep -q ":${LISTEN_PORT} "; then
-    HEALTH_ISSUE="active but nothing listening on port ${LISTEN_PORT}"
-  elif ! timeout 5 bash -c "exec 3<>/dev/tcp/127.0.0.1/${LISTEN_PORT}" 2>/dev/null; then
-    HEALTH_ISSUE="port ${LISTEN_PORT} listed as listening but local TCP connect failed"
   fi
 
   # Config-drift check: does the file on disk still match the checksum
@@ -1392,11 +2008,24 @@ if [[ "$MODE" == "update-core-only" ]]; then
       UPDATE_SUCCEEDED=1
       break
     fi
+    # The installer can exit non-zero *after* it has already replaced the
+    # binary: on a real update its final start_xray runs right after it has
+    # reset /var/log/xray ownership to its own base-unit user, so the start
+    # fails and it exits 1. Re-assert our ownership before retrying, so the
+    # retry (which then sees "No new version" and exits 0) -- and systemd's
+    # own Restart=on-failure in the meantime -- can actually bring the
+    # service back up. See ensure_xray_log_permissions for the full story.
+    ensure_xray_log_permissions
     if [[ "$attempt" -lt "$XRAY_INSTALL_ATTEMPTS" ]]; then
       echo "Xray-core update attempt ${attempt} failed, retrying in 5s..."
       sleep 5
     fi
   done
+
+  # Also on the success path (an update can complete cleanly when the
+  # service wasn't running, in which case the installer never tried to start
+  # it but still reset the ownership) and before any restart below.
+  ensure_xray_log_permissions
 
   if [[ "$UPDATE_SUCCEEDED" -ne 1 ]]; then
     warn "Could not reach the Xray-core installer after ${XRAY_INSTALL_ATTEMPTS} attempts (network issue?)."
@@ -1968,6 +2597,11 @@ else
     if bash -c "$(curl -fsSL --connect-timeout 10 --max-time 60 https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh)" @ install; then
       break
     fi
+    # Same reasoning as in --update-core-only: a non-zero exit can come from
+    # the installer's own post-update start_xray failing on log ownership it
+    # just reset. Re-assert ours so the service isn't left crash-looping
+    # (and tripping the restart-budget alert) through the retry delay.
+    ensure_xray_log_permissions
     if [[ "$attempt" -eq "$XRAY_INSTALL_ATTEMPTS" ]]; then
       err "Failed to install Xray-core after ${XRAY_INSTALL_ATTEMPTS} attempts (likely a network issue reaching GitHub)."
       exit 1
@@ -1977,6 +2611,7 @@ else
   done
   date +%s > "$XRAY_UPDATE_CHECK_CACHE"
 fi
+ensure_xray_log_permissions
 
 AFTER_XRAY_VERSION=$(xray version 2>/dev/null | head -n1 || echo "none")
 record_xray_binary_checksum
@@ -2069,7 +2704,18 @@ ProtectControlGroups=true
 RestrictSUIDSGID=true
 LockPersonality=true
 MemoryDenyWriteExecute=true
+# Both of these are list-type settings that MERGE across the base unit and
+# every drop-in -- they do not override. The official installer's base unit
+# already grants CAP_NET_ADMIN + CAP_NET_BIND_SERVICE for both, so assigning
+# just CAP_NET_BIND_SERVICE here would leave CAP_NET_ADMIN in place (checked
+# with systemd-analyze: "Service has network configuration privileges").
+# The empty assignment first resets the inherited list; Xray needs only
+# CAP_NET_BIND_SERVICE (to bind a port below 1024 as a non-root user) --
+# CAP_NET_ADMIN is only for transparent-proxy/mark features this config
+# doesn't use.
+CapabilityBoundingSet=
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 ProtectClock=true
 ProtectHostname=true
@@ -2415,7 +3061,6 @@ systemctl enable --now daily-reboot.timer
 # If $0 isn't a real file (e.g. run via `bash <(curl -Ls ...)`, where $0
 # points to a process-substitution pipe, not a regular file), fall back
 # to re-downloading the script fresh from SCRIPT_SOURCE_URL instead.
-REALITY_SHORTCUT="/usr/local/bin/reality"
 SELF_PATH=$(readlink -f "$0" 2>/dev/null || echo "$0")
 REALITY_SHORTCUT_RESOLVED=$(readlink -f "$REALITY_SHORTCUT" 2>/dev/null || echo "$REALITY_SHORTCUT")
 
@@ -2547,6 +3192,8 @@ mkdir -p /etc/update-motd.d
 cat > /etc/update-motd.d/99-xray-reality <<EOF
 #!/bin/sh
 ${REALITY_SHORTCUT} --status 2>/dev/null | head -n 25
+echo ""
+echo "  Run 'reality' for the management menu."
 EOF
 chmod +x /etc/update-motd.d/99-xray-reality
 
@@ -2586,19 +3233,9 @@ if [[ "$REALITY_TIMERS_ENABLED" -eq 1 ]]; then
   echo "  (disable any of them with: systemctl disable --now <name>)"
 fi
 echo ""
-echo "Re-run any time (works via either name, from any directory):"
-echo "  reality                     -> re-apply full setup (backs up old config first)"
-echo "  reality --rotate-uuid       -> revoke current client link, keep server identity"
-echo "  reality --rotate-all        -> full credential reset (invalidates everything)"
-echo "  reality --rotate-all --force -> same, but skips confirmation (for non-interactive use)"
-echo "  reality --change-sni <domain> -> change only the SNI, keeps UUID/keys unchanged"
-echo "  reality --change-fingerprint <value> -> change client uTLS fingerprint, no restart needed"
-echo "  reality --change-port <port> -> change only the listen port, keeps UUID/keys unchanged"
-echo "  reality --show              -> reprint current client link + QR"
-echo "  reality --status            -> consolidated health/config summary"
-echo "  reality --health-check      -> run the watchdog check manually"
-echo "  reality --update-core-only  -> check/apply an Xray-core update now"
-echo "  reality --set-webhook <url> -> also send critical alerts to a webhook (Slack/ntfy/etc)"
+echo "Management command installed -- run ${C_BOLD}reality${C_RESET} for the interactive menu,"
+echo "or use the subcommands below (also available as flags, e.g. reality --status)."
+usage
 
 step "final" "Restarting Xray"
 SERVICE_CURRENTLY_ACTIVE=$(systemctl is-active --quiet "${SERVICE_NAME}" && echo 1 || echo 0)
