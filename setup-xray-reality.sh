@@ -708,7 +708,10 @@ ensure_xray_log_permissions() {
 write_config() {
   mkdir -p "$XRAY_CONFIG_DIR"
   local tmp_config
-  tmp_config=$(mktemp "${XRAY_CONFIG_DIR}/.config.json.XXXXXX")
+  # The temp file must end in .json: newer Xray-core releases (26.x) refuse to
+  # load a config whose filename has no recognised extension, even with
+  # -format json ("unsupported config file extension").
+  tmp_config=$(mktemp --suffix=.json "${XRAY_CONFIG_DIR}/.config.XXXXXX")
   cat > "$tmp_config" <<EOF
 {
   "log": {
