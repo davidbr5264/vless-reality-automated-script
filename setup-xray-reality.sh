@@ -88,10 +88,13 @@
 #                                           Meant to be run on a timer -- see
 #                                           the reality-watchdog.timer unit.
 #   ./setup-xray-reality.sh --update-core-only
-#                                           Check for and apply an Xray-core
-#                                           update only, independent of a full
-#                                           re-run. Restarts the service only
-#                                           if the binary actually changed.
+#                                           MANUAL Xray-core update: check for
+#                                           and apply a new release, independent
+#                                           of a full re-run. Restarts the service
+#                                           only if the binary actually changed.
+#                                           Xray-core is never updated
+#                                           automatically (no timer, and a re-run
+#                                           of the install leaves it alone).
 #   ./setup-xray-reality.sh --rotate-all --force
 #                                           Same as --rotate-all, but skips
 #                                           the interactive confirmation
@@ -109,14 +112,16 @@
 #
 # Unattended timers (installed automatically by a full install, see step 10):
 #   reality-watchdog.timer      every 10 min  -> --health-check
-#   reality-autoupdate.timer    weekly        -> --update-core-only
 #   reality-backup-maintenance.timer  weekly  -> --dedupe-backups
-# All three are ordinary systemd timers; inspect/disable with the usual
+# (Older installs had a reality-autoupdate.timer; re-running the install removes
+# it. Xray-core is only updated when you ask: `reality update-core`.)
+# Both are ordinary systemd timers; inspect/disable with the usual
 # systemctl commands (e.g. `systemctl disable --now reality-watchdog.timer`).
 #
 # What a full install does:
 #   1. Prepares the server: full apt update/upgrade, cleanup, essential tools
-#   2. Installs latest official Xray-core (XTLS/Xray-install)
+#   2. Installs the official Xray-core (XTLS/Xray-install) if it isn't installed
+#      yet. An existing install is left as is -- never auto-updated
 #   3. Generates UUID, REALITY x25519 keypair, and a short ID
 #   4. Writes a minimal-logging config.json (VLESS + TCP + XTLS-Vision + REALITY)
 #      camouflaged as a real site (randomly picked from a small pool of
@@ -127,11 +132,15 @@
 #   8. Schedules a daily reboot at midnight (server local time)
 #   9. Prints a ready-to-import vless:// link + QR code
 #  10. Installs unattended reliability timers (health-check watchdog,
-#      Xray-core auto-update, config-drift check) and a login banner
+#      backup maintenance) and a login banner
 #
 # Re-running (install or any --rotate mode) automatically backs up the
 # previous config + client info under /root/xray-backups/<timestamp>/
 # before making changes, so nothing is silently lost.
+#
+# The install itself never prompts. SNI, port and fingerprint are edited
+# afterwards from the `reality` management menu (Edit SNI / Edit port / Edit
+# fingerprint), or with the matching --change-* subcommands.
 #
 # Environment variable overrides (only take effect on a genuinely
 # first-time install -- once state exists, re-runs always keep whatever's
@@ -248,8 +257,8 @@ SNI_DOMAIN_ENV_OVERRIDE="${SNI_DOMAIN:-}"
 # public script doesn't converge on one identical, easily-cataloged SNI.
 # Live-verified below regardless (see the SNI check further down, which
 # now also runs for non-interactive installs, not just interactive ones)
-# and always overridable -- interactively, via SNI_DOMAIN=..., or later
-# via --rotate-all.
+# and always overridable -- via SNI_DOMAIN=... at install time, or later
+# from the `reality` menu (Edit SNI).
 #
 # Deliberately excludes anything under googlevideo.com: unlike ytimg.com/
 # youtube.com, it has no stable, fixed public hostname for actual video
@@ -465,8 +474,8 @@ fi
 # from racing on the same config/backup/state files. Held for the life of
 # this process; released automatically on exit, including on error.
 #
-# Modes driven by the unattended timers (watchdog every 10min, autoupdate
-# and backup-maintenance weekly) wait briefly for the lock instead of
+# Modes driven by the unattended timers (watchdog every 10min and
+# backup-maintenance weekly) wait briefly for the lock instead of
 # failing immediately -- an interactive/manual run should fail fast on a
 # genuine double-launch, but two automated timers occasionally landing in
 # the same few seconds is expected and shouldn't produce a spurious
@@ -481,7 +490,7 @@ case "$MODE" in
     # fail with "another run is in progress". `logs` is read-only, and
     # `log -f` would otherwise hold the lock for as long as you keep following.
     ;;
-  health-check|update-core-only|dedupe-backups)
+  health-check|dedupe-backups)
     flock -w 30 200 || LOCK_ACQUIRED=0
     ;;
   *)
@@ -1338,7 +1347,7 @@ if [[ "$MODE" == "uninstall" ]]; then
     echo ""
     warn "This REMOVES the Xray proxy and what this script installed for it:"
     echo "    - the xray service, binary, config and credentials (the current client link stops working)"
-    echo "    - the watchdog, auto-update, backup-maintenance and daily-reboot timers"
+    echo "    - the watchdog, backup-maintenance and daily-reboot timers"
     echo "    - ${REALITY_SHORTCUT}, the login banner, logs, backups and ${CLIENT_INFO_FILE}"
     echo "    - the UFW rule(s) for the Xray port (currently ${LISTEN_PORT})"
     echo "  Left in place: UFW itself + SSH rule, fail2ban, BBR/sysctl tuning, journald cap."
@@ -1358,11 +1367,12 @@ if [[ "$MODE" == "uninstall" ]]; then
 
   # Stop the automation first so nothing restarts xray (or reboots the box)
   # while it's being taken apart.
+  # (reality-autoupdate no longer exists, but older installs may still have it.)
   for unit in reality-watchdog reality-autoupdate reality-backup-maintenance daily-reboot; do
     systemctl disable --now "${unit}.timer" >/dev/null 2>&1 || true
     rm -f "/etc/systemd/system/${unit}.timer" "/etc/systemd/system/${unit}.service"
   done
-  ok "Removed the watchdog, auto-update, backup-maintenance and daily-reboot timers."
+  ok "Removed the watchdog, backup-maintenance and daily-reboot timers."
 
   # Firewall: delete every rule tagged for Xray (this port and any stale ones).
   # Highest rule number first so the remaining numbers stay valid as we go.
@@ -1478,15 +1488,15 @@ if [[ "$MODE" == "menu" ]]; then
     box_sep
     menu_row 1 "Install / re-apply full setup"
     menu_row 2 "Update this script"
-    menu_row 3 "Update Xray-core"
+    menu_row 3 "Update Xray-core (manual)"
     menu_row 4 "Uninstall"
     box_sep
     menu_row 5 "Show client link + QR code"
     menu_row 6 "Rotate UUID (revoke the current client link)"
     menu_row 7 "Rotate ALL credentials (UUID + keys)"
-    menu_row 8 "Change SNI (camouflage domain)"
-    menu_row 9 "Change port"
-    menu_row 10 "Change client fingerprint"
+    menu_row 8 "Edit SNI (camouflage domain)"
+    menu_row 9 "Edit port"
+    menu_row 10 "Edit client fingerprint"
     box_sep
     menu_row 11 "Start"
     menu_row 12 "Stop"
@@ -1988,14 +1998,13 @@ if [[ "$MODE" == "health-check" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# MODE: --update-core-only  (meant to run unattended on reality-autoupdate.timer)
+# MODE: --update-core-only  (manual only -- nothing runs this automatically)
 #
 # Just the Xray-core version-check-and-install logic from a full install,
 # decoupled from everything else (apt upgrade, firewall, fail2ban, sysctl,
 # etc). Restarts the service only if the binary actually changed, so a
 # no-op check (already current) doesn't cause an unnecessary reconnect.
-# Lets Xray-core stay current on a schedule without needing to remember to
-# re-run the full script.
+# Run it yourself (`reality update-core` or the menu) when you want to update.
 # ---------------------------------------------------------------------------
 if [[ "$MODE" == "update-core-only" ]]; then
   step "update-core" "Checking Xray-core for updates"
@@ -2029,7 +2038,7 @@ if [[ "$MODE" == "update-core-only" ]]; then
 
   if [[ "$UPDATE_SUCCEEDED" -ne 1 ]]; then
     warn "Could not reach the Xray-core installer after ${XRAY_INSTALL_ATTEMPTS} attempts (network issue?)."
-    echo "         Will try again on the next scheduled run." >&2
+    echo "         Try again later with: reality update-core" >&2
     exit 1
   fi
 
@@ -2172,7 +2181,7 @@ if [[ "$MODE" == "change-sni" ]]; then
 
   NEW_SNI="$NEW_SNI_ARG"
   if [[ -n "$NEW_SNI" ]]; then
-    # Same sanitization as the install-time prompt: strip scheme, path,
+    # Strip scheme, path,
     # port, in case someone pastes a full URL by mistake.
     NEW_SNI="${NEW_SNI#http://}"
     NEW_SNI="${NEW_SNI#https://}"
@@ -2413,8 +2422,8 @@ fi
 # process substitution -- that path already always re-downloads fresh) or
 # if GitHub isn't reachable within a few seconds.
 #
-# Runs in the background so its network round-trip overlaps with the SNI
-# prompt (waiting on you) and step 1's apt operations below, instead of
+# Runs in the background so its network round-trip overlaps with step 1's
+# apt operations below, instead of
 # adding its own few seconds serially before anything else starts. The
 # result is collected further down, once there's been time for it to finish.
 SELF_UPDATE_CHECK_PATH=$(readlink -f "$0" 2>/dev/null || echo "$0")
@@ -2440,84 +2449,6 @@ if [[ -f "$SELF_UPDATE_CHECK_PATH" ]]; then
     rm -f "$REMOTE_SCRIPT_TMP"
   ) &
   SELF_UPDATE_BG_PID=$!
-fi
-
-# Only prompt for a custom SNI on a genuinely first-time install (no UUID
-# yet means no existing state) and only when there's an actual interactive
-# terminal to prompt on -- piped/scripted/non-interactive runs just fall
-# through to the existing default (env var override, or the pool-randomized
-# pick from SNI_POOL -- see the non-interactive verification block further
-# down for how that gets checked too).
-if [[ -z "$UUID" ]] && [[ -t 0 ]]; then
-  while true; do
-    echo ""
-    echo "REALITY camouflage target (SNI)"
-    echo "This is the real site Xray impersonates during the TLS handshake."
-    echo "It should be a real TLS1.3 site, not a huge one (avoid google.com/"
-    echo "microsoft.com-scale sites -- large certs can trip protocol issues,"
-    echo "and CDN-fronted domains make REALITY easier to fingerprint)."
-    read -r -t 300 -p "Domain to use [${SNI_DOMAIN}]: " SNI_INPUT || true
-    if [[ -n "$SNI_INPUT" ]]; then
-      # Basic sanitization in case someone pastes a full URL by mistake:
-      # strip scheme, path, port, and trailing slashes -- keep just the host.
-      SNI_INPUT="${SNI_INPUT#http://}"
-      SNI_INPUT="${SNI_INPUT#https://}"
-      SNI_INPUT="${SNI_INPUT%%/*}"
-      SNI_INPUT="${SNI_INPUT%%:*}"
-      if [[ -n "$SNI_INPUT" ]]; then
-        SNI_DOMAIN="$SNI_INPUT"
-      fi
-    fi
-
-    # Best-effort live check: does this domain actually resolve and serve
-    # TLS1.3 on 443? openssl may not be installed yet this early (that
-    # happens in step 1 below) -- skip the check gracefully if so, rather
-    # than block on a tool that isn't there yet.
-    if command -v openssl >/dev/null 2>&1; then
-      if timeout 6 openssl s_client -connect "${SNI_DOMAIN}:443" -servername "${SNI_DOMAIN}" -tls1_3 </dev/null >/dev/null 2>&1; then
-        ok "Confirmed: ${SNI_DOMAIN} resolves and serves TLS1.3 on port 443."
-        break
-      else
-        warn "Couldn't confirm ${SNI_DOMAIN} serves TLS1.3 on port 443 (DNS failure, no"
-        echo "         response, or TLS1.3 unsupported). REALITY requires this to work." >&2
-        read -r -t 300 -p "Use it anyway? (y/N): " SNI_FORCE || true
-        if [[ "$SNI_FORCE" =~ ^[Yy]$ ]]; then
-          break
-        fi
-        # loop back and re-prompt
-      fi
-    else
-      break
-    fi
-  done
-  echo "Using: ${SNI_DOMAIN}"
-fi
-
-# Non-interactive first installs (piped/scripted/automated) previously
-# skipped SNI verification entirely -- the live TLS1.3 check above only
-# ever ran inside the interactive prompt loop. That left the (now
-# pool-randomized) default entirely unverified for anyone running this via
-# `bash <(curl ...)` non-interactively or through automation. Do the same
-# live check here, falling through the rest of the pool if the picked
-# candidate fails, rather than silently proceeding with something REALITY
-# might not actually work against.
-if [[ -z "$UUID" ]] && [[ ! -t 0 ]] && command -v openssl >/dev/null 2>&1; then
-  SNI_VERIFIED=0
-  for candidate in "$SNI_DOMAIN" "${SNI_POOL[@]}"; do
-    if timeout 6 openssl s_client -connect "${candidate}:443" -servername "${candidate}" -tls1_3 </dev/null >/dev/null 2>&1; then
-      if [[ "$candidate" != "$SNI_DOMAIN" ]]; then
-        warn "SNI target '${SNI_DOMAIN}' didn't verify; using '${candidate}' instead (first pool candidate that passed a live TLS1.3 check)."
-      fi
-      SNI_DOMAIN="$candidate"
-      SNI_VERIFIED=1
-      break
-    fi
-  done
-  if [[ "$SNI_VERIFIED" -ne 1 ]]; then
-    warn "Could not verify TLS1.3 on port 443 for any SNI candidate (network issue during install?)."
-    echo "         Proceeding with '${SNI_DOMAIN}' unverified -- if the tunnel doesn't work," >&2
-    echo "         check connectivity and reconsider the SNI with --rotate-all." >&2
-  fi
 fi
 
 step "1/10" "Preparing server (updates, cleanup, essential tools)"
@@ -2556,8 +2487,7 @@ if [[ -f /var/run/reboot-required ]]; then
   echo "      or reboot manually now with: reboot"
 fi
 
-# Collect the backgrounded self-update check (started before the SNI
-# prompt) now that step 1's apt operations have given it plenty of time
+# Collect the backgrounded self-update check (started before step 1) now that step 1's apt operations have given it plenty of time
 # to finish -- its network round-trip overlapped with real work above
 # instead of adding its own delay serially before anything started.
 if [[ -n "$SELF_UPDATE_BG_PID" ]]; then
@@ -2570,27 +2500,42 @@ if [[ -n "$SELF_UPDATE_BG_PID" ]]; then
 fi
 rm -f "$SELF_UPDATE_RESULT_FILE"
 
+# Live-verify the SNI on a genuinely first-time install (no saved UUID yet).
+# There is no prompt any more: SNI, port and fingerprint come from the saved
+# state, an env var (SNI_DOMAIN / LISTEN_PORT / FINGERPRINT) or the defaults,
+# and can be edited later from the `reality` menu. Runs here, after step 1,
+# because openssl is guaranteed to be installed by now. If the picked SNI
+# fails the TLS1.3 check, fall through the rest of SNI_POOL rather than
+# proceed with something REALITY might not work against.
+if [[ -z "$UUID" ]] && command -v openssl >/dev/null 2>&1; then
+  SNI_VERIFIED=0
+  for candidate in "$SNI_DOMAIN" "${SNI_POOL[@]}"; do
+    if timeout 6 openssl s_client -connect "${candidate}:443" -servername "${candidate}" -tls1_3 </dev/null >/dev/null 2>&1; then
+      if [[ "$candidate" != "$SNI_DOMAIN" ]]; then
+        warn "SNI target '${SNI_DOMAIN}' didn't verify; using '${candidate}' instead (first pool candidate that passed a live TLS1.3 check)."
+      fi
+      SNI_DOMAIN="$candidate"
+      SNI_VERIFIED=1
+      break
+    fi
+  done
+  if [[ "$SNI_VERIFIED" -ne 1 ]]; then
+    warn "Could not verify TLS1.3 on port 443 for any SNI candidate (network issue during install?)."
+    echo "         Proceeding with '${SNI_DOMAIN}' unverified -- if the tunnel doesn't work," >&2
+    echo "         pick another one with: reality change-sni <domain>" >&2
+  fi
+  echo "Using SNI: ${SNI_DOMAIN}"
+fi
+
 step "2/10" "Installing Xray-core (official installer)"
 mkdir -p "$XRAY_CONFIG_DIR"
 BEFORE_XRAY_VERSION=$(xray version 2>/dev/null | head -n1 || echo "none")
 
-# The official installer always makes a full network round-trip to check
-# the latest release, even when almost certainly already current. Skip
-# that full check if we already have xray installed and checked within
-# the last 24h -- falls back to the full check on first install, or once
-# the cache goes stale, so this can't silently skip updates forever.
-XRAY_UPDATE_CHECK_CACHE="${XRAY_CONFIG_DIR}/.last-xray-checkupdate"
-SKIP_INSTALLER_CHECK=0
-if command -v xray >/dev/null 2>&1 && [[ -f "$XRAY_UPDATE_CHECK_CACHE" ]]; then
-  LAST_CHECK=$(cat "$XRAY_UPDATE_CHECK_CACHE" 2>/dev/null || echo 0)
-  NOW=$(date +%s)
-  if [[ "$LAST_CHECK" =~ ^[0-9]+$ ]] && [[ $((NOW - LAST_CHECK)) -lt 86400 ]]; then
-    SKIP_INSTALLER_CHECK=1
-  fi
-fi
-
-if [[ "$SKIP_INSTALLER_CHECK" -eq 1 ]]; then
-  ok "Xray-core was checked for updates within the last 24h -- skipping the full check this run."
+# Install Xray-core only when it isn't there yet. An existing install is
+# deliberately left alone -- re-running this script never updates it. To update
+# Xray-core, run it yourself: `reality update-core` (or the menu).
+if command -v xray >/dev/null 2>&1; then
+  ok "Xray-core already installed (${BEFORE_XRAY_VERSION}) -- leaving it as is (update manually with: reality update-core)."
 else
   XRAY_INSTALL_ATTEMPTS=3
   for attempt in $(seq 1 "$XRAY_INSTALL_ATTEMPTS"); do
@@ -2598,7 +2543,7 @@ else
       break
     fi
     # Same reasoning as in --update-core-only: a non-zero exit can come from
-    # the installer's own post-update start_xray failing on log ownership it
+    # the installer's own post-install start_xray failing on log ownership it
     # just reset. Re-assert ours so the service isn't left crash-looping
     # (and tripping the restart-budget alert) through the retry delay.
     ensure_xray_log_permissions
@@ -2609,7 +2554,7 @@ else
     echo "Xray-core install attempt ${attempt} failed, retrying in 5s..."
     sleep 5
   done
-  date +%s > "$XRAY_UPDATE_CHECK_CACHE"
+  date +%s > "${XRAY_CONFIG_DIR}/.last-xray-checkupdate"
 fi
 ensure_xray_log_permissions
 
@@ -3089,9 +3034,19 @@ else
   fi
 fi
 
-step "10/10" "Setting up unattended reliability (watchdog, auto-update, drift check, login summary)"
+step "10/10" "Setting up unattended reliability (watchdog, backup maintenance, login summary)"
 
-# Only wire up timers that call `reality --health-check` / `--update-core-only`
+# Xray-core is no longer auto-updated. Older installs of this script created a
+# weekly reality-autoupdate timer -- remove it so re-applying the setup turns
+# that behaviour off for them too.
+if [[ -f /etc/systemd/system/reality-autoupdate.timer || -f /etc/systemd/system/reality-autoupdate.service ]]; then
+  systemctl disable --now reality-autoupdate.timer >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/reality-autoupdate.timer /etc/systemd/system/reality-autoupdate.service
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  ok "Removed the old Xray-core auto-update timer."
+fi
+
+# Only wire up timers that call `reality --health-check` / `--dedupe-backups`
 # if the shortcut is actually present -- if it failed to install above (rare,
 # only when both $0 wasn't a real file and re-downloading failed), don't
 # create timers that would just fail every run.
@@ -3118,31 +3073,6 @@ Description=Run reality health check every 10 minutes
 [Timer]
 OnBootSec=5min
 OnUnitActiveSec=10min
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-EOF
-
-  # Auto-update: keeps Xray-core current on a schedule, independent of
-  # remembering to re-run the full script. RandomizedDelaySec spreads load
-  # on the upstream installer and avoids every install checking in lockstep.
-  cat > /etc/systemd/system/reality-autoupdate.service <<EOF
-[Unit]
-Description=Check for and apply Xray-core updates
-
-[Service]
-Type=oneshot
-ExecStart=${REALITY_SHORTCUT} --update-core-only
-EOF
-
-  cat > /etc/systemd/system/reality-autoupdate.timer <<'EOF'
-[Unit]
-Description=Weekly Xray-core update check
-
-[Timer]
-OnCalendar=weekly
-RandomizedDelaySec=6h
 Persistent=true
 
 [Install]
@@ -3177,12 +3107,12 @@ WantedBy=timers.target
 EOF
 
   systemctl daemon-reload
-  systemctl enable --now reality-watchdog.timer reality-autoupdate.timer reality-backup-maintenance.timer >/dev/null 2>&1 || \
+  systemctl enable --now reality-watchdog.timer reality-backup-maintenance.timer >/dev/null 2>&1 || \
     warn "Could not enable one or more timers. Check: systemctl list-timers 'reality-*'"
-  ok "Watchdog (every 10min), auto-update (weekly), and backup maintenance (weekly) timers enabled."
+  ok "Watchdog (every 10min) and backup maintenance (weekly) timers enabled."
 else
   REALITY_TIMERS_ENABLED=0
-  warn "Skipping watchdog/auto-update/backup-maintenance timers -- the 'reality' shortcut isn't in place (see above)."
+  warn "Skipping watchdog/backup-maintenance timers -- the 'reality' shortcut isn't in place (see above)."
 fi
 
 # Login summary: surfaces service/firewall/backup state passively on every
@@ -3228,11 +3158,11 @@ if [[ "$REALITY_TIMERS_ENABLED" -eq 1 ]]; then
   echo ""
   echo "Unattended reliability timers are active:"
   echo "  reality-watchdog.timer     -> health check + self-heal restart every 10min"
-  echo "  reality-autoupdate.timer   -> Xray-core update check, weekly"
   echo "  reality-backup-maintenance.timer -> dedupe redundant backups, weekly"
   echo "  (disable any of them with: systemctl disable --now <name>)"
 fi
 echo ""
+echo "SNI, port and fingerprint can be edited any time from the menu -- run ${C_BOLD}reality${C_RESET}."
 echo "Management command installed -- run ${C_BOLD}reality${C_RESET} for the interactive menu,"
 echo "or use the subcommands below (also available as flags, e.g. reality --status)."
 usage
